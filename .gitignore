@@ -1,0 +1,12 @@
+﻿# virtual-env
+venv/
+# editor / py cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# OS junk
+.DS_Store
+Thumbs.db
+# dotenv / secrets
+.env

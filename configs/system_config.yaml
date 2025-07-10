@@ -1,0 +1,26 @@
+# System-wide configuration for secrets and global settings
+# This file uses ${...} placeholders. The system will load the corresponding
+# environment variables at runtime.
+
+# Central configuration for all system secrets and global settings.
+slack_tokens:
+  orchestrator_app_token: "${ORCHESTRATOR_APP_TOKEN}"
+  writer_app_token: "${WRITER_APP_TOKEN}"
+  grok_app_token: "${GROK_APP_TOKEN}"
+
+  orchestrator_bot_token: "${ORCHESTRATOR_BOT_TOKEN}"
+  writer_bot_token: "${WRITER_BOT_TOKEN}"
+  grok_bot_token: "${GROK_BOT_TOKEN}"
+
+api_keys:
+  anthropic: "${ANTHROPIC_API_KEY}"
+
+channels:
+  coordination: "${COORDINATION_CHANNEL}"
+
+features:
+  tts:
+    enabled: true
+    default_voice: "en-US-AriaNeural"
+    default_rate: "+0%"
+    max_text_length: 5000

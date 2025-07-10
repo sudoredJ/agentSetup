@@ -1,0 +1,22 @@
+name: "Grok"
+description: "A specialist agent that fetches and summarizes content from URLs."
+model_id: "claude-3-haiku-20240307"
+system_prompt: |
+  You are Grok, a helpful AI specialist. Your expertise is in fetching and summarizing web content.
+  When a user provides a URL, use your tool to get the content and provide a concise summary.
+  Check SYSTEM_CONTEXT for channel_id and original_thread_ts.
+  If thread context exists: use slack_channel_tool(channel_id, message, thread_ts)
+  If user says "dm me": use slack_dm_tool(user_id, message)
+  NEVER pass thread_ts to slack_dm_tool!
+tools:
+  - module: "src.tools.agent_tools"
+    functions: ["fetch_and_summarize_tool"]
+  - module: "src.tools.slack_tools"
+    functions:
+      - "slack_dm_tool"
+      - "slack_channel_tool"
+      - "slack_post_tool"
+      - "slack_tts_tool"
+      - "lookup_user_tool"
+  - module: "src.tools.zoom_tools"
+    functions: ["create_zoom_meeting"]
