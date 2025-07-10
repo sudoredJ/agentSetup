@@ -1,8 +1,21 @@
+"""Generic agent-side tools
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+These are domain-agnostic helper functions exposed as `@tool`s so that agents
+can analyse requests, compose messages, fetch URLs, etc.
+
+Provided tools:
+• analyse_request_tool           – classify user intent (research context)
+• compose_message_tool           – compose a formatted message
+• proofread_tool                 – simple spelling/grammar fixer
+• web_search_tool                – placeholder web search (duckduckgo_search)
+• fetch_and_summarize_tool       – fetch webpage + summary
+
+All functions follow the smolagents docstring format (brief summary + Args).
+"""
 from smolagents import tool
 import requests
 from bs4 import BeautifulSoup
 import re
-from duckduckgo_search import DDGS
 
 @tool
 def analyze_request_tool(request: str) -> str:
@@ -17,6 +30,8 @@ def analyze_request_tool(request: str) -> str:
         return "**Analysis:** Simple greeting - respond warmly and offer assistance."
     elif 'dm me' in request_lower:
         return "**Analysis:** User wants a direct message sent to them. Extract any specific message content or send a friendly greeting."
+    elif any(word in request_lower for word in ['write', 'story', 'poem', 'create', 'compose', 'draft']):
+        return "**Analysis:** Creative writing request - use creative tools to fulfill."
     elif any(word in request_lower for word in ['what', 'how', 'why', 'when', 'where']):
         return "**Analysis:** Information request - user wants research and explanation."
     else:
@@ -37,26 +52,6 @@ def web_search_tool(query: str, max_results: int = 5) -> str:
     )
 
 @tool
-def analyze_creative_request_tool(request: str) -> str:
-    """Analyzes creative writing or composition requests.
-
-    Args:
-        request (str): The user's request text to be analyzed.
-    """
-    request_lower = request.lower().strip()
-    
-    if 'dm me' in request_lower:
-        if '"' in request:
-            message_content = request.split('"')[1] if '"' in request else "Hello!"
-            return f"**Analysis:** User wants a DM with the message: '{message_content}'"
-        else:
-            return "**Analysis:** User wants a friendly DM sent to them."
-    elif any(word in request_lower for word in ['write', 'story', 'poem', 'create']):
-        return "**Analysis:** Creative writing request - use creative tools to fulfill."
-    else:
-        return f"**Analysis:** Request: {request}. Determine if this needs creative writing or simple communication."
-
-@tool
 def compose_message_tool(recipient: str, content: str = None, tone: str = "friendly") -> str:
     """Composes a well-formatted message for a recipient.
 
@@ -66,7 +61,7 @@ def compose_message_tool(recipient: str, content: str = None, tone: str = "frien
         tone (str, optional): The tone of the message ('friendly', 'professional'). Defaults to "friendly".
     """
     if not content:
-        content = "Hello! I hope you're having a great day."
+        content = f"Hello {recipient}! I hope you're having a great day."
         
     if tone == "friendly":
         prefix = "Hi there!"
@@ -78,7 +73,7 @@ def compose_message_tool(recipient: str, content: str = None, tone: str = "frien
         prefix = "Hello!"
         suffix = "Have a wonderful day!"
         
-    return f"""{prefix}
+    return f"""{prefix} {recipient},
 
 {content}
 
@@ -138,9 +133,7 @@ def fetch_and_summarize_tool(url: str) -> str:
         chunks = (phrase.strip()for line in lines for phrase in line.split("  "))
         text = '\n'.join(chunk for chunk in chunks if chunk)
         
-        # For this example, we'll provide a mock summary.
-        # In a real implementation, you would use a summarization model here.
-        # This is where you might call an LLM with the extracted text.
+        # mock summary:
         summary = f"Successfully fetched content from {url}. The content appears to be about..."
         if len(text) > 200:
              summary += f" '{text[:200].strip()}...'"

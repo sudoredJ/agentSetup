@@ -1,4 +1,18 @@
-# src/tools/slack_tools.py – complete implementation provided by user
+"""Slack helper tools
+~~~~~~~~~~~~~~~~~~~~~~
+This module groups all tool functions that interact with Slack and can be
+called from agents via the `smolagents.tool` decorator.
+
+Key sections:
+• Message helpers:   `slack_dm_tool`, `slack_post_tool`, `slack_channel_tool`
+• User lookup:       `lookup_user_tool`
+• TTS helper:        `slack_tts_tool` – converts text to speech with edge-tts,
+  uploads to a public file-sharing host (file.io, 0x0.st fallback) and posts
+  the download link to Slack.  No `files:write` scope required.
+
+All functions are safe for import-time injection: the `SpecialistAgent`
+injects `_client` (Slack WebClient) and `_bot_name` at runtime.
+"""
 
 from smolagents import tool
 from slack_sdk import WebClient
@@ -185,7 +199,7 @@ def slack_tts_tool(channel_id: str, text: str, voice: str = "en-US-AriaNeural") 
                 "🔊 **Text-to-Speech Audio Generated**\n\n"
                 f"🔗 Download: {link}\n"
                 f"🎙️ Voice: `{voice}`\n"
-                f"�� Text: _{preview}_\n\n"
+                f"📝 Text: _{preview}_\n\n"
                 "_Note: Link expires in 24 hours_"
             )
             _client.chat_postMessage(channel=channel_id, text=message, unfurl_links=False)

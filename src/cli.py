@@ -103,7 +103,7 @@ def _run_bot(args: argparse.Namespace) -> None:
     """Activate selected plugins and launch the main application."""
 
     # ------------------------------------------------------------------
-    #  Progress bar powered by "alive-progress" (optional)
+    #  Progress bar powered by "yaspin"
     # ------------------------------------------------------------------
     try:
         from alive_progress import alive_bar, config_handler

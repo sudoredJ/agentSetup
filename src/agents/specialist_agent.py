@@ -1,9 +1,6 @@
-import logging
-import time
 import re
 import importlib
 from typing import Dict, Any, List, Callable
-import json
 
 from smolagents import LiteLLMModel
 from src.core.friendly_code_agent import FriendlyCodeAgent

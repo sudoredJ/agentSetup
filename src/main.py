@@ -8,8 +8,6 @@ import re
 import atexit
 from typing import Dict, Any
 from dotenv import load_dotenv
-from collections import defaultdict, deque
-import json
 from rich.logging import RichHandler
 from rich.console import Console
 from rich.panel import Panel
