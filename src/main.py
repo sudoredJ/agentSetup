@@ -55,27 +55,6 @@ active_requests: Dict[str, Dict[str, Any]] = {}
 # Config loader
 # ---------------------------------------------------------------------------
 
-def _legacy_load_config(path: str = 'configs/system_config.yaml') -> dict:
-    """Load YAML config and expand ${ENV} placeholders."""
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        placeholders = re.findall(r'\$\{(\w+)\}', content)
-        for ph in placeholders:
-            env_val = os.environ.get(ph)
-            if env_val is None:
-                logging.error(f"Missing env var referenced in config: {ph}")
-                sys.exit(1)
-            # replace both quoted and un-quoted occurrences
-            content = content.replace(f'"${{{ph}}}"', f'"{env_val}"')
-            content = content.replace(f'${{{ph}}}', env_val)
-
-        return yaml.safe_load(content)
-    except Exception as exc:
-        logging.error(f"Config error: {exc}")
-        sys.exit(1)
-
 # ---------------------------------------------------------------------------
 # Main entry
 # ---------------------------------------------------------------------------

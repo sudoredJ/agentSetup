@@ -10,3 +10,9 @@ __pycache__/
 Thumbs.db
 # dotenv / secrets
 .env
+# audio artefacts
+*.mp3
+# diagrams / generated assets
+*.svg
+# reports
+vulture_report.txt

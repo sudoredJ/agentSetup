@@ -2,7 +2,6 @@ import logging
 import sys
 import threading
 import time
-import functools  # Added for partial functions if needed
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -72,9 +71,11 @@ class BaseAgent:
                     **kwargs,
                 )
                 elapsed = (time.time() - start_t) * 1000
+                body_snippet = str(resp)[:300]
+                more = '...' if len(str(resp)) > 300 else ''
                 self.logger.debug(
                     f"[{self.name}] ⇠ Slack API Response: method={method} ok={resp.get('ok')} "
-                    f"status={getattr(resp, 'status_code', 'n/a')} elapsed={elapsed:.2f}ms body={resp}"
+                    f"status={getattr(resp, 'status_code', 'n/a')} elapsed={elapsed:.2f}ms body={body_snippet}{more}"
                 )
                 return resp
             except Exception as err:
