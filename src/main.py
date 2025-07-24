@@ -8,9 +8,10 @@ import re
 import atexit
 from typing import Dict, Any
 from dotenv import load_dotenv
-from rich.logging import RichHandler
-from rich.console import Console
 from rich.panel import Panel
+from src.core.log_setup import init_logging
+from src.orchestrator.assignment import check_and_assign as ext_check_and_assign
+from src.orchestrator.handlers import register_specialist_handlers as ext_register_specialist_handlers
 from yaspin import yaspin
 from slack_sdk.errors import SlackApiError
 from src.core.config_loader import load_config  # NEW shared config loader
@@ -22,13 +23,7 @@ dotenv_path = os.path.join(project_root, '.env')
 # ----------------------------------------------------------------------------
 # Logging setup (Rich)
 # ----------------------------------------------------------------------------
-console = Console()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    datefmt="[%X]",
-    handlers=[RichHandler(console=console, rich_tracebacks=True, markup=True)]
-)
+console = init_logging()
 
 # ----------------------------------------------------------------------------
 # Environment loading
@@ -45,8 +40,6 @@ sys.path.insert(0, project_root)
 from src.core.base_agent import BaseAgent
 from src.agents.specialist_agent import SpecialistAgent
 from src.core.utils import sanitize_mentions
-from src.orchestrator.assignment import check_and_assign
-from src.orchestrator.handlers import register_specialist_handlers
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -133,11 +126,111 @@ def main():
     coordination_channel = config['channels']['coordination']
 
     # ------------------------------------------------ Assignment logic
-    threading.Thread(
-        target=check_and_assign,
-        args=(client, coord_thread_ts, active_requests[coord_thread_ts], specialists, coordination_channel),
-        daemon=True
-    ).start()
+    def check_and_assign(client, thread_ts: str, request_data: dict | None = None):
+        """Poll the thread for evaluation messages and assign the best specialist."""
+        timeout = 8          # seconds total wait (increased)
+        check_interval = 0.5 # seconds between polls (decreased)
+        start_time = time.time()
+
+        logging.info(f"Checking thread {thread_ts} for evaluations... (timeout {timeout}s)")
+        logging.info(f"Expected specialists: {list(specialists.keys())}")
+
+        evaluations: Dict[str, int] = {}
+
+        try:
+            with yaspin(text="Waiting for evaluations", color="cyan") as spin:
+                while time.time() - start_time < timeout:
+                    try:
+                        # Fresh API call every loop so we don't miss late messages
+                        thread = client.conversations_replies(channel=coordination_channel, ts=thread_ts)
+                    except SlackApiError as api_err:
+                        # Handle rate limiting gracefully
+                        if api_err.response.get("error") == "ratelimited":
+                            retry_after = int(api_err.response.headers.get("Retry-After", 2))
+                            logging.warning(f"Rate limited when fetching thread {thread_ts}. Retrying after {retry_after}s…")
+                            time.sleep(retry_after)
+                            continue  # retry loop without counting towards timeout
+                        else:
+                            raise
+
+                    for msg in thread.get("messages", []):
+                        text = msg.get("text", "")
+
+                        # Pattern: agent evaluation report (with or without emoji)
+                        # Try both patterns to be flexible
+                        match = re.search(r'(?:🧠\s*)?(\w+)\s+reporting:\s+Confidence\s+(\d+)%', text)
+
+                        if match:
+                            agent_name = match.group(1)
+                            confidence = int(match.group(2))
+                            if agent_name not in evaluations:
+                                evaluations[agent_name] = confidence
+                                logging.info(f"  Found evaluation: {agent_name} = {confidence}%")
+                                spin.text = f"Collected {len(evaluations)}/{len(specialists)} evaluations"
+
+                    if len(evaluations) >= len(specialists):
+                        logging.info("All specialists have responded!")
+                        break
+
+                    time.sleep(check_interval)
+
+                # end while loop
+                spin.ok("✔")
+
+            logging.info(f"Total evaluations received: {len(evaluations)} out of {len(specialists)} specialists")
+            missing_specialists = set(specialists.keys()) - set(evaluations.keys())
+            if missing_specialists:
+                logging.warning(f"Missing responses from: {missing_specialists}")
+            
+            if evaluations:
+                logging.info(f"Evaluations: {evaluations}")
+            else:
+                logging.info("No evaluations found. Dumping raw thread messages for debugging…")
+                thread = client.conversations_replies(channel=coordination_channel, ts=thread_ts)
+                for i, msg in enumerate(thread.get("messages", [])):
+                    logging.info(f"Message {i}: {msg.get('text', '')[:120]}")
+
+            # Assign best specialist
+            if evaluations:
+                agent_name, confidence = max(evaluations.items(), key=lambda x: x[1])
+                if confidence > 0 and agent_name in specialists:
+                    specialist = specialists[agent_name]
+                    logging.info(f"Assigning to {agent_name} (confidence: {confidence}%)")
+                    try:
+                        client.chat_postMessage(
+                            channel=coordination_channel, 
+                            thread_ts=thread_ts,
+                            text=f"ASSIGNED: <@{specialist.bot_user_id}> - Please handle this request."
+                        )
+                    except Exception as e:
+                        logging.error(f"Failed to post assignment: {e}")
+                else:
+                    client.chat_postMessage(
+                        channel=coordination_channel, 
+                        thread_ts=thread_ts,
+                        text="No specialist confident enough to handle this request."
+                    )
+            else:
+                logging.warning(f"No evaluations received in time!")
+                try:
+                    client.chat_postMessage(
+                        channel=coordination_channel, 
+                        thread_ts=thread_ts,
+                        text="No specialists responded to evaluation request."
+                    )
+                except Exception as e:
+                    logging.error(f"Failed to post no-response message: {e}")
+
+        except Exception as e:
+            logging.error(f"Assignment error: {e}", exc_info=True)
+            try:
+                client.chat_postMessage(
+                    channel=coordination_channel, 
+                    thread_ts=thread_ts,
+                    text=f"Error during assignment: {str(e)}"
+                )
+            except Exception:
+                pass
 
     # ------------------------------------------------ Orchestrator handlers
     @orchestrator.app.event("app_mention")
@@ -176,9 +269,13 @@ def main():
             pass
 
         specialist_mentions = " ".join([f"<@{s.bot_user_id}>" for s in specialists.values()])
+        escaped_text = text.replace("\"", r"\\\"")
         coord_msg = client.chat_postMessage(
             channel=coordination_channel,
-            text=f"Request from <@{user_id}> | Task: \"{text}\"\n\n{specialist_mentions} please evaluate."
+            text=(
+                f"Request from <@{user_id}> | Task: \"{escaped_text}\"\n\n"
+                f"{specialist_mentions} please evaluate."
+            )
         )
 
         coord_thread_ts = coord_msg['ts']
@@ -192,8 +289,13 @@ def main():
         }
 
         threading.Thread(
-            target=check_and_assign,
-            args=(client, coord_thread_ts, active_requests[coord_thread_ts], specialists, coordination_channel),
+            target=ext_check_and_assign,
+            args=(client, coord_thread_ts, active_requests[coord_thread_ts]),
+            kwargs=dict(
+                specialists=specialists,
+                coordination_channel=coordination_channel,
+                active_requests=active_requests,
+            ),
             daemon=True
         ).start()
 
@@ -201,11 +303,159 @@ def main():
     def suppress_orchestrator_messages(event, logger):
         pass  # Orchestrator ignores channel chatter
 
-    # ------------------------------------------------ Specialist handlers (moved to src/orchestrator/handlers.py)
+    # ------------------------------------------------ Specialist handlers
+    def register_specialist_handlers(specialist: SpecialistAgent, specialist_name: str):
+        """Register message/event handlers for a specialist with proper closure."""
+        
+        # Store references in the closure
+        spec = specialist
+        name = specialist_name
 
-    # Register handlers for each specialist using refactored helper
+        @spec.app.event("message")
+        def spec_message_handler(event: Dict[str, Any], client, logger):
+            channel = event.get("channel")
+            if channel != coordination_channel:
+                return
+            
+            # Ignore bot messages except from orchestrator
+            if event.get("bot_id") and event.get("user") != orchestrator.bot_user_id:
+                return
+
+            text = event.get("text", "")
+            msg_ts = event["ts"]
+            thread_ts = event.get("thread_ts", msg_ts)
+
+            # ---------------- Evaluation phase ----------------
+            if "please evaluate" in text and f"<@{spec.bot_user_id}>" in text:
+                m_task = re.search(r'Task: "(.*?)"', text, re.DOTALL)
+                if m_task:
+                    task = m_task.group(1)
+                    logger.info(f"{name} evaluating: '{task}'")
+                    
+                    # Run evaluation in a thread to avoid blocking
+                    def run_evaluation():
+                        try:
+                            _, conf = spec.evaluate_request(task)
+                            reply = f"🧠 {name} reporting: Confidence {conf}% for \"{task}\""
+                            logger.info(f"{name} posting evaluation: {conf}%")
+                            client.chat_postMessage(
+                                channel=coordination_channel, 
+                                thread_ts=msg_ts, 
+                                text=reply
+                            )
+                        except Exception as e:
+                            logger.error(f"{name} failed to post evaluation", exc_info=True)
+                    
+                    threading.Thread(target=run_evaluation, daemon=True).start()
+
+            # ---------------- Assignment phase ----------------
+            elif f"ASSIGNED: <@{spec.bot_user_id}>" in text:
+                logger.info(f"{name} received assignment!")
+
+                req_meta = active_requests.get(thread_ts, {})
+                
+                # Get thread messages
+                try:
+                    thread = client.conversations_replies(channel=coordination_channel, ts=thread_ts)
+                except Exception as e:
+                    logger.error(f"Failed to get thread replies: {e}")
+                    return
+
+                for msg in thread.get("messages", []):
+                    # Fixed regex - single backslash
+                    user_match = re.search(r'Request from <@(\w+)>', msg.get("text", ""))
+                    task_match = re.search(r'Task: "(.*?)"', msg.get("text", ""), re.DOTALL)
+
+                    if user_match and task_match:
+                        user_id = user_match.group(1)
+                        request_text = task_match.group(1)
+
+                        # Build context
+                        coord_context = thread.get("messages", [])
+                        orig_context: list[dict] = []
+
+                        if req_meta.get("channel_id") and req_meta.get("original_thread_ts"):
+                            try:
+                                orig_thread = orchestrator.client.conversations_replies(
+                                    channel=req_meta["channel_id"],
+                                    ts=req_meta["original_thread_ts"],
+                                    limit=50,
+                                )
+                                orig_context = orig_thread.get("messages", [])
+                            except Exception as fetch_err:
+                                logger.error("Could not fetch original thread context", exc_info=True)
+
+                        full_context = coord_context + orig_context
+
+                        # --- Deep debug dump
+                        logger.info(f"DEBUG: {name} Assignment details")
+                        logger.info(f"  • request_text: '{request_text}'")
+                        logger.info(f"  • user_id: {user_id}")
+                        logger.info(f"  • context messages: {len(full_context)}")
+
+                        def run_assignment():
+                            tlog = logging.getLogger(f"Thread-{name}")
+                            tlog.info("Assignment thread started")
+                            try:
+                                process_method = getattr(spec, "process_assignment", None)
+                                if not callable(process_method):
+                                    raise AttributeError("process_assignment not found")
+
+                                tlog.info("Calling process_assignment …")
+                                process_method(request_text, user_id, thread_ts, full_context)
+                                tlog.info("process_assignment finished")
+                            except Exception as err:
+                                tlog.error("Error inside assignment thread", exc_info=True)
+                                try:
+                                    client.chat_postMessage(
+                                        channel=coordination_channel,
+                                        text=f"❌ {name} error: {type(err).__name__}: {err}",
+                                        thread_ts=thread_ts,
+                                    )
+                                except Exception:
+                                    pass
+
+                        try:
+                            t = threading.Thread(
+                                target=run_assignment, 
+                                name=f"{name}-Assign-{thread_ts[:8]}", 
+                                daemon=True
+                            )
+                            t.start()
+                            logger.info(f"Started thread {t.name}")
+                        except Exception as thread_err:
+                            logger.error("Failed to start assignment thread", exc_info=True)
+                            client.chat_postMessage(
+                                channel=coordination_channel,
+                                text=f"❌ Thread creation failed for {name}: {thread_err}",
+                                thread_ts=thread_ts,
+                            )
+                        break
+
+        # other event handlers
+        @spec.app.event('app_mention')
+        def spec_mention_handler(event, client, logger):
+            if event.get('channel') != coordination_channel:
+                client.chat_postMessage(
+                    channel=event['channel'], 
+                    thread_ts=event.get('thread_ts', event['ts']),
+                    text=f"Please mention <@{orchestrator.bot_user_id}> for assistance. I work through the orchestrator."
+                )
+
+        @spec.app.event('reaction_added')
+        def spec_reaction_handler(event, logger):
+            pass  # Suppress warnings
+
+    # Register handlers for each specialist
     for n, s in specialists.items():
-        register_specialist_handlers(s, n, coordination_channel, orchestrator, active_requests)
+        ext_register_specialist_handlers(
+        s,
+        n,
+        orchestrator=orchestrator,
+        coordination_channel=coordination_channel,
+        active_requests=active_requests,
+    )
+        logging.info(f"✓ Registered handlers for {n}")
 
     # ------------------------------------------------ Ready!
     console.print(Panel(
