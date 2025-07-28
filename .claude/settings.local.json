@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python test:*)",
+      "Bash(rm:*)",
+      "Bash(mkdir:*)",
+      "Bash(mv:*)",
+      "Bash(true)",
+      "Bash(ls:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(git clone:*)",
+      "Bash(ls:*)",
+      "Bash(uv venv:*)",
+      "Bash(source:*)",
+      "Bash(uv sync:*)",
+      "Bash(python:*)"
+    ],
+    "deny": []
+  }
+}

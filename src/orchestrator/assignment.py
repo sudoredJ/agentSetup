@@ -32,8 +32,9 @@ def check_and_assign(
     function is now pure and easily testable.
     """
 
-    timeout = 8  # seconds total wait (unchanged)
-    check_interval = 0.5  # seconds between polls
+    timeout = 8  # seconds total wait (balanced for speed and reliability)
+    check_interval = 0.3  # seconds between polls (avoid rate limiting)
+    min_confidence = 30  # minimum confidence threshold
     start_time = time.time()
 
     logging.info(
@@ -42,6 +43,10 @@ def check_and_assign(
     logging.info("Expected specialists: %s", list(specialists.keys()))
 
     evaluations: Dict[str, int] = {}
+    
+    # Add a small initial delay to allow agents to start processing
+    time.sleep(0.2)  # minimal delay for faster response
+    logging.info("Starting evaluation check after 0.2s delay")
 
     try:
         with yaspin(text="Waiting for evaluations", color="cyan") as spin:
@@ -51,40 +56,69 @@ def check_and_assign(
                     thread = client.conversations_replies(
                         channel=coordination_channel, ts=thread_ts
                     )
+                    logging.info(f"DEBUG: Fetched thread with {len(thread.get('messages', []))} messages")
                 except SlackApiError as api_err:
                     if api_err.response.get("error") == "ratelimited":
                         retry_after = int(api_err.response.headers.get("Retry-After", 2))
+                        # Cap retry delay at 10 seconds for better responsiveness
+                        actual_retry = min(retry_after, 10)
                         logging.warning(
-                            "Rate limited when fetching thread %s. Retrying after %ss…",
+                            "Rate limited when fetching thread %s. Retrying after %ss (capped from %ss)…",
                             thread_ts,
+                            actual_retry,
                             retry_after,
                         )
-                        time.sleep(retry_after)
+                        # Don't count rate limit delays against our timeout
+                        start_time += actual_retry
+                        time.sleep(actual_retry)
                         continue
                     raise  # re-raise unknown errors
 
-                for msg in thread.get("messages", []):
+                messages = thread.get("messages", [])
+                logging.info(f"DEBUG: Processing {len(messages)} messages in evaluation loop")
+                for i, msg in enumerate(messages):
                     text = msg.get("text", "")
+                    logging.info(f"DEBUG: Message {i}: '{text[:100]}...'")
+                    # Debug logging
+                    if "reporting:" in text.lower():
+                        logging.info(f"DEBUG: Found potential eval message: '{text}'")
                     match = re.search(
-                        r"(?:🧠\s*)?(\w+)\s+reporting:\s+Confidence\s+(\d+)%", text
+                        r"(?:🧠\s*)?(\w+)\s+reporting:\s+Confidence\s+(\d+)%.*", text, re.IGNORECASE
                     )
                     if match:
                         agent_name = match.group(1)
                         confidence = int(match.group(2))
+                        logging.info(
+                            "  Regex matched! agent_name='%s', confidence=%s", agent_name, confidence
+                        )
                         if agent_name not in evaluations:
                             evaluations[agent_name] = confidence
                             logging.info(
-                                "  Found evaluation: %s = %s%%", agent_name, confidence
+                                "  Added evaluation: %s = %s%%", agent_name, confidence
                             )
                             spin.text = (
                                 f"Collected {len(evaluations)}/{len(specialists)} evaluations"
+                            )
+                        else:
+                            logging.info(
+                                "  Duplicate evaluation for %s ignored", agent_name
                             )
 
                 if len(evaluations) >= len(specialists):
                     logging.info("All specialists have responded!")
                     break
 
-                time.sleep(check_interval)
+                # Log progress
+                elapsed = time.time() - start_time
+                logging.info(f"Evaluation progress: {len(evaluations)}/{len(specialists)} specialists, {elapsed:.1f}s elapsed")
+                
+                # Dynamic check interval - start slow, speed up near timeout
+                if elapsed < 2:
+                    time.sleep(0.5)  # Check every 0.5s initially to avoid rate limits
+                elif elapsed < 5:
+                    time.sleep(0.3)  # Medium frequency
+                else:
+                    time.sleep(0.2)  # Fast polling near timeout
 
             spin.ok("✔")
 
@@ -109,8 +143,57 @@ def check_and_assign(
 
         # ---------------- Assignment ----------------
         if evaluations:
+            # Check if we need collaborative discussion
+            max_confidence = max(evaluations.values()) if evaluations else 0
+            
+            # If initial max confidence is below 50%, start collaborative discussion
+            if max_confidence < 50:
+                logging.info("Max confidence %s%% is below 50%%, starting collaborative discussion", max_confidence)
+                
+                try:
+                    # Import and use the discussion coordinator
+                    from src.agents.negotiation_module import AgentDiscussionCoordinator
+                    
+                    coordinator = AgentDiscussionCoordinator()
+                    
+                    # Extract task from thread
+                    task = None
+                    thread = client.conversations_replies(channel=coordination_channel, ts=thread_ts)
+                    for msg in thread.get("messages", []):
+                        task_match = re.search(r'Task: "(.*?)"', msg.get("text", ""), re.DOTALL)
+                        if task_match:
+                            task = task_match.group(1)
+                            break
+                    
+                    if task:
+                        # Run collaborative discussion
+                        final_agent, final_confidence, final_evaluations = coordinator.facilitate_discussion(
+                            task, specialists, client, coordination_channel, thread_ts
+                        )
+                        
+                        if final_agent and final_confidence >= min_confidence:
+                            specialist = specialists[final_agent]
+                            logging.info(
+                                "After discussion, assigning to %s (confidence: %s%%)", final_agent, final_confidence
+                            )
+                            client.chat_postMessage(
+                                channel=coordination_channel,
+                                thread_ts=thread_ts,
+                                text=(
+                                    f"ASSIGNED: <@{specialist.bot_user_id}> - Please handle this request."
+                                ),
+                            )
+                            return
+                        else:
+                            logging.info("Discussion did not reach consensus above threshold")
+                    
+                except Exception as e:
+                    logging.error("Failed to run collaborative discussion: %s", e)
+                    # Fall back to regular assignment
+            
+            # Regular assignment (or fallback)
             agent_name, confidence = max(evaluations.items(), key=lambda x: x[1])
-            if confidence > 0 and agent_name in specialists:
+            if confidence >= min_confidence and agent_name in specialists:
                 specialist = specialists[agent_name]
                 logging.info(
                     "Assigning to %s (confidence: %s%%)", agent_name, confidence
@@ -126,10 +209,14 @@ def check_and_assign(
                 except Exception as exc:
                     logging.error("Failed to post assignment: %s", exc)
             else:
+                logging.info(
+                    "Highest confidence %s%% is below threshold %s%%", 
+                    confidence, min_confidence
+                )
                 client.chat_postMessage(
                     channel=coordination_channel,
                     thread_ts=thread_ts,
-                    text="No specialist confident enough to handle this request.",
+                    text=f"No specialist confident enough to handle this request. (Highest: {agent_name} with {confidence}%, threshold: {min_confidence}%)",
                 )
         else:
             logging.warning("No evaluations received in time!")
@@ -143,7 +230,7 @@ def check_and_assign(
                 logging.error("Failed to post no-response message: %s", exc)
 
     except Exception as err:
-        logging.error("Assignment error: %s", err, exc_info=True)
+        logging.error("Assignment error during evaluation loop: %s", err, exc_info=True)
         try:
             client.chat_postMessage(
                 channel=coordination_channel,

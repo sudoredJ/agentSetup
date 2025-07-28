@@ -1,5 +1,6 @@
 import re
 import importlib
+import logging
 from typing import Dict, Any, List, Callable
 
 from smolagents import LiteLLMModel
@@ -11,7 +12,7 @@ from src.integrations.zoom_client import ZoomClient
 class SpecialistAgent(BaseAgent):
     """An intelligent agent initialized from a profile."""
 
-    def __init__(self, agent_profile: dict, slack_token: str, coordination_channel: str):
+    def __init__(self, agent_profile: dict, slack_token: str, coordination_channel: str, use_dspy: bool = False):
         self.agent_profile = agent_profile
         super().__init__(name=self.agent_profile['name'], token=slack_token)
 
@@ -21,14 +22,76 @@ class SpecialistAgent(BaseAgent):
 
         initialized_tools = self._initialize_tools()
 
-        self.ai_agent = FriendlyCodeAgent(
-            tools=initialized_tools,
-            model=LiteLLMModel(
-                model_id=self.agent_profile['model_id'],
-                system=self.agent_profile['system_prompt']
-            ),
-            max_steps=3
-        )
+        # Check if DSPy should be used (make it optional)
+        self.use_dspy = use_dspy or agent_profile.get('use_dspy', False)
+        self.dspy_available = False
+        
+        if self.use_dspy:
+            # Try to use DSPy agent, but fall back gracefully
+            try:
+                if self.name == "Grok":
+                    # Use specialized Grok DSPy agent
+                    from .dspy_modules import GrokDSPyAgent
+                    self.ai_agent = GrokDSPyAgent(
+                        tools=initialized_tools,
+                        model_id=self.agent_profile['model_id'],
+                        system_prompt=self.agent_profile['system_prompt']
+                    )
+                    self.logger.info(f"[{self.name}] 🧠 Initialized with Grok DSPy agent")
+                    self.dspy_available = True
+                elif self.name == "Writer":
+                    # Use specialized Writer DSPy module with Socratic capabilities
+                    from .dspy_modules import WriterModule
+                    # Create a wrapper that has the expected interface
+                    class WriterDSPyAgent:
+                        def __init__(self, tools, model_id, system_prompt):
+                            self.module = WriterModule()
+                            self.tools = tools
+                            self.logger = logging.getLogger("WriterDSPyAgent")
+                        
+                        def forward(self, request: str, user_id: str = None, context: List[Dict] = None):
+                            return self.module.forward(request, user_id=user_id, context=context)
+                        
+                        def run(self, prompt: str):
+                            # Extract request from prompt for compatibility
+                            request = prompt.split("User's request:")[-1].strip() if "User's request:" in prompt else prompt
+                            return self.forward(request)
+                
+                    self.ai_agent = WriterDSPyAgent(
+                        tools=initialized_tools,
+                        model_id=self.agent_profile['model_id'],
+                        system_prompt=self.agent_profile['system_prompt']
+                    )
+                    self.logger.info(f"[{self.name}] 🧠 Initialized with Writer DSPy module (with Socratic capabilities)")
+                    self.dspy_available = True
+                else:
+                    # Use standard DSPy agent
+                    from ..core.dspy_agent import DSPyAgent
+                    self.ai_agent = DSPyAgent(
+                        tools=initialized_tools,
+                        model_id=self.agent_profile['model_id'],
+                        system_prompt=self.agent_profile['system_prompt']
+                    )
+                    self.logger.info(f"[{self.name}] 🧠 Initialized with DSPy agent")
+                    self.dspy_available = True
+                    
+            except Exception as e:
+                self.logger.warning(f"[{self.name}] Failed to initialize DSPy: {e}. Falling back to standard agent.")
+                self.use_dspy = False
+                self.dspy_available = False
+                # Fall through to FriendlyCodeAgent initialization
+        
+        if not self.use_dspy or not self.dspy_available:
+            # Use existing FriendlyCodeAgent
+            self.ai_agent = FriendlyCodeAgent(
+                tools=initialized_tools,
+                model=LiteLLMModel(
+                    model_id=self.agent_profile['model_id'],
+                    system=self.agent_profile['system_prompt']
+                ),
+                max_steps=3
+            )
+            self.logger.info(f"[{self.name}] 🤖 Initialized with FriendlyCodeAgent")
 
     # ---------------------------------------------------------------------
     # Tool initialisation
@@ -103,23 +166,13 @@ class SpecialistAgent(BaseAgent):
         temp_pattern = r'\b(\d+)\s*([cf])\s+to\s+([cf])\b'
         has_temp_conversion = bool(re.search(temp_pattern, request_lower))
 
-        if self.name == "Researcher":
+        if self.name == "Writer":
             confidence = 50
-            if any(k in request_lower for k in ['research', 'find', 'search', 'what', 'how', 'why']):
-                confidence = 90
-            elif any(k in request_lower for k in ['tts', 'text to speech', 'say', 'speak', 'voice', 'audio']):
-                confidence = 85  # Grok can handle TTS
-            elif 'dm me' in request_lower or request_lower in ['hi', 'hello', 'hey']:
-                confidence = 85
-            elif has_temp_conversion:
-                confidence = 80
-            result = confidence >= 60, min(confidence, 95)
-            self.logger.debug(f"[{self.name}] ⇦ Exit evaluate_request → {result}")
-            return result
-
-        elif self.name == "Writer":
-            confidence = 50
-            if any(k in request_lower for k in ['write', 'story', 'compose', 'draft', 'poem', 'creative']):
+            # Socratic dialog requests - highest priority for Writer
+            if any(k in request_lower for k in ['socratic', 'help me think', 'guide me through', 'explore with me', 'let\'s discuss']):
+                confidence = 98  # Very high confidence for Socratic dialog
+                self.logger.debug(f"[{self.name}] Detected Socratic dialog request")
+            elif any(k in request_lower for k in ['write', 'story', 'compose', 'draft', 'poem', 'creative']):
                 confidence = 95
             elif any(k in request_lower for k in ['tts', 'text to speech', 'say', 'speak', 'voice', 'audio']):
                 confidence = 80  # Writer can also handle TTS
@@ -133,20 +186,87 @@ class SpecialistAgent(BaseAgent):
 
         elif self.name == "Grok":
             confidence = 50
-            if any(k in request_lower for k in ['url', 'link', 'website', 'fetch', 'summarize', 'http']):
+            
+            # Check if this is a Socratic dialog request - Grok should NOT handle these
+            if any(k in request_lower for k in ['socratic', 'help me think', 'guide me through', 'explore with me', 'let\'s discuss']):
+                # Grok should have low confidence for Socratic requests - let Writer handle them
+                confidence = 20
+                self.logger.debug(f"[{self.name}] Detected Socratic request, deferring to Writer")
+            # Weather and astronomical requests - very high priority
+            elif any(k in request_lower for k in ['weather', 'temperature', 'forecast', 'rain', 'snow', 'sunny', 'cloudy', 
+                                                   'sunrise', 'sunset', 'dawn', 'dusk', 'golden hour', 'sun rise', 'sun set',
+                                                   'what time is sunset', 'what time is sunrise', 'when does the sun']):
+                confidence = 96
+                self.logger.debug(f"[{self.name}] Detected weather/astronomical request")
+            # arXiv/academic paper requests - very high priority
+            elif ('arxiv' in request_lower or 
+                  ('paper' in request_lower and any(word in request_lower for word in ['find', 'search', 'get', 'download', 'look'])) or
+                  any(k in request_lower for k in ['academic paper', 'research paper', 'publication', 'journal', 'preprint'])):
+                confidence = 94
+                self.logger.debug(f"[{self.name}] Detected arXiv/academic paper request")
+            # URL fetching - highest priority for backward compatibility
+            elif any(k in request_lower for k in ['url', 'link', 'website', 'fetch', 'http://', 'https://']):
                 confidence = 95
-            elif 'dm me' in request_lower or request_lower in ['hi', 'hello', 'hey']:
-                confidence = 70
+            # Deep research keywords (but not if combined with Socratic)
+            elif any(k in request_lower for k in ['research', 'investigate', 'deep dive', 'comprehensive', 'analysis']) and not any(k in request_lower for k in ['socratic', 'help me think']):
+                confidence = 92
+            # Question words that suggest research (but not Socratic exploration)
+            elif any(k in request_lower for k in ['what is', 'how does', 'why does', 'explain', 'tell me about']) and not any(k in request_lower for k in ['socratic', 'explore with me']):
+                confidence = 88
+            # General search keywords
+            elif any(k in request_lower for k in ['search', 'find', 'look up', 'information about']):
+                confidence = 85
             elif has_temp_conversion:
                 confidence = 85
-            elif any(k in request_lower for k in ['what', 'how', 'why', 'explain']):
-                confidence = 75
+            elif 'dm me' in request_lower or request_lower in ['hi', 'hello', 'hey']:
+                confidence = 70
+            # Any question mark suggests a research task (unless it's Socratic)
+            elif '?' in request_lower and not any(k in request_lower for k in ['socratic', 'help me think']):
+                confidence = 80
             result = confidence >= 60, min(confidence, 95)
             self.logger.debug(f"[{self.name}] ⇦ Exit evaluate_request → {result}")
             return result
 
         self.logger.debug(f"[{self.name}] ⇦ Exit evaluate_request → (False, 0)")
         return False, 0
+
+    # ---------------------------------------------------------------------
+    # Collaborative evaluation
+    # ---------------------------------------------------------------------
+    def collaborative_evaluate(self, task: str, discussion_history: List[Dict]) -> tuple[int, str]:
+        """Evaluate task collaboratively, considering other agents' evaluations."""
+        # First get base evaluation
+        can_handle, base_confidence = self.evaluate_request(task)
+        
+        if not can_handle:
+            return base_confidence, f"{self.name} cannot handle this type of request"
+        
+        # If we have DSPy negotiation capabilities, use them
+        if self.use_dspy:
+            try:
+                from src.agents.negotiation_module import CollaborativeEvaluator
+                
+                # Create evaluator with agent's capabilities
+                capabilities = self.agent_profile.get('description', f'{self.name} specialist agent')
+                evaluator = CollaborativeEvaluator(self.name, capabilities)
+                
+                # Get adjustment based on discussion
+                adjustment, reasoning = evaluator.evaluate_with_discussion(task, discussion_history)
+                
+                # Apply adjustment to base confidence
+                new_confidence = max(0, min(100, base_confidence + adjustment))
+                
+                self.logger.info(f"[{self.name}] Collaborative evaluation: base={base_confidence}%, adjustment={adjustment}, final={new_confidence}%")
+                
+                return new_confidence, reasoning
+                
+            except Exception as e:
+                self.logger.error(f"[{self.name}] Failed to use collaborative evaluator: {e}")
+                # Fall back to base evaluation
+        
+        # Default: return base evaluation with simple reasoning
+        reasoning = f"{self.name} has {base_confidence}% confidence based on capabilities"
+        return base_confidence, reasoning
 
     # ---------------------------------------------------------------------
     # Task processing
@@ -224,7 +344,7 @@ class SpecialistAgent(BaseAgent):
                 return
 
             # ------------------------------------------------- Greeting
-            elif any(word in request_lower for word in ["hello", "hi", "hey"]):
+            elif request_lower in ["hello", "hi", "hey", "hello!", "hi!", "hey!"]:
                 self.logger.info("Handling greeting")
                 self.client.chat_postMessage(
                     channel=original_user,
@@ -283,44 +403,268 @@ class SpecialistAgent(BaseAgent):
                 for t in self.ai_agent.tools:
                     if getattr(t, 'name', None):
                         tool_names.append(t.name)
-                        inputs = getattr(t, 'inputs', {})
-                        params: list[str] = []
-                        for p_name, p_info in inputs.items():
-                            if p_info.get('default') is not None:
-                                params.append(f"{p_name}=None")
-                            else:
-                                params.append(p_name)
-                        sig = f"{t.name}({', '.join(params)})"
+                        # Handle both old-style inputs dict and new-style parameters
+                        if hasattr(t, 'inputs') and isinstance(t.inputs, dict):
+                            inputs = t.inputs
+                            params: list[str] = []
+                            for p_name, p_info in inputs.items():
+                                if isinstance(p_info, dict) and p_info.get('default') is not None:
+                                    params.append(f"{p_name}=None")
+                                else:
+                                    params.append(p_name)
+                            sig = f"{t.name}({', '.join(params)})"
+                        else:
+                            # For tools without inputs metadata, show simple signature
+                            sig = f"{t.name}(...)"
                         tool_descriptions.append(f"- {sig}")
 
-                self.logger.info("Available tools: %s", tool_names)
+                self.logger.info(f"[{self.name}] 🛠️ Available tools: {tool_names}")
 
                 tools_list = "\n".join(tool_descriptions) if tool_descriptions else (
                     "- slack_dm_tool(user_id, message)\n- slack_channel_tool(channel_id, message, thread_ts=None)"
                 )
 
-                thinking_prompt = (
-                    f"You are {self.name}, a helpful AI assistant.\n\n"
-                    f"User's request: {request_text}\n\n"
-                    "Recent conversation context:\n"
-                    f"{context_str if context_str else '(No previous context)'}\n\n"
-                    "Available tools (call exactly as shown, no markdown, no quotes):\n"
-                    f"{tools_list}\n\n"
-                    "When you are ready to answer, choose ONE of these actions:\n"
-                    "1. If a direct message is appropriate → write a single line that is JUST the function call, e.g.\n"
-                    f"   slack_dm_tool('{original_user}', 'Hello! …')\n"
-                    "2. If replying in the thread is better → use slack_channel_tool with thread_ts.\n"
-                    "3. If the user asks for TTS or text-to-speech → use slack_tts_tool(user_id, text).\n"
-                    "4. If no tool is needed, output the plain answer text.\n\n"
-                    "Do NOT wrap calls in back-ticks or code blocks. Output nothing else after the call line."
-                )
+                # Check for Socratic dialog request first
+                is_socratic_request = any(word in request_lower for word in ['socratic', 'help me think', 'guide me through', 'explore with me', 'let\'s discuss'])
+                
+                # Check for arXiv-specific requests first
+                is_arxiv_request = ('arxiv' in request_lower or 
+                                   ('paper' in request_lower and any(word in request_lower for word in ['find', 'search', 'get', 'download', 'look'])) or
+                                   any(word in request_lower for word in ['academic paper', 'research paper', 'publication', 'journal', 'preprint']))
+                
+                # Special handling for arXiv requests
+                if self.name == "Grok" and is_arxiv_request:
+                    self.logger.info(f"[{self.name}] 📚 Detected arXiv request")
+                    
+                    # Parse the request to determine what to search for
+                    search_query = request_text
+                    # Remove common prefixes and clean up the query
+                    for prefix in ['find an arxiv paper on', 'find arxiv paper on', 'search arxiv for', 'arxiv paper on', 'arxiv papers on', 'find me ai papers from', 'find me papers from']:
+                        if prefix in request_lower:
+                            search_query = request_text[len(prefix):].strip()
+                            break
+                    
+                    # Clean up the query - remove question marks, extra words, etc.
+                    search_query = search_query.replace('?', '').replace('please', '').strip()
+                    # Remove common filler words
+                    filler_words = ['please', 'can you', 'could you', 'would you', 'will you', 'i need', 'i want']
+                    for word in filler_words:
+                        search_query = search_query.replace(word, '').strip()
+                    
+                    # Extract key terms for better search
+                    if 'harvard' in search_query.lower() and 'berkman' in search_query.lower():
+                        # For Harvard Berkman Klein Center queries, focus on the key terms
+                        search_query = 'harvard berkman klein center ai papers'
+                    elif 'ai' in search_query.lower() and 'papers' in search_query.lower():
+                        # For general AI papers queries, clean up
+                        search_query = search_query.replace('ai papers', 'artificial intelligence').replace('papers', 'research')
+                    
+                    # Execute arXiv search directly
+                    try:
+                        from src.tools.arxiv_tools import search_arxiv_papers
+                        self.logger.info(f"[{self.name}] 🔍 Searching arXiv for: '{search_query}'")
+                        search_results = search_arxiv_papers(query=search_query)
+                        
+                        # Send results to user
+                        dm_message = f"Here are arXiv papers on '{search_query}':\n\n{search_results}\n\n— {self.name}"
+                        dm_result = self.client.chat_postMessage(
+                            channel=original_user,
+                            text=dm_message
+                        )
+                        self.logger.info(f"[{self.name}] ✅ arXiv results sent via DM: {dm_result['ok']}")
+                        
+                        # Report completion
+                        self.client.chat_postMessage(
+                            channel=self.coordination_channel,
+                            text=f"✅ {self.name} completed – arXiv search results sent to <@{original_user}>",
+                            thread_ts=thread_ts
+                        )
+                        return
+                    except Exception as e:
+                        self.logger.error(f"[{self.name}] ❌ arXiv search failed: {e}", exc_info=True)
+                        # Send error message to user
+                        error_msg = f"I encountered an error searching arXiv: {str(e)}\n\nPlease try rephrasing your request.\n\n— {self.name}"
+                        self.client.chat_postMessage(channel=original_user, text=error_msg)
+                        self.client.chat_postMessage(
+                            channel=self.coordination_channel,
+                            text=f"❌ {self.name} error: arXiv search failed - {str(e)}",
+                            thread_ts=thread_ts
+                        )
+                        return
+                
+                # Weather queries - handle directly
+                elif any(word in request_lower for word in ['weather', 'temperature', 'forecast', 'sunrise', 'sunset']) and self.name == "Grok":
+                    self.logger.info(f"[{self.name}] 🌤️ Handling weather request directly")
+                    try:
+                        # Extract location from request
+                        location = None
+                        if ' in ' in request_lower:
+                            location = request_text.split(' in ', 1)[1].strip().rstrip('?').rstrip('.')
+                        elif ' for ' in request_lower:
+                            location = request_text.split(' for ', 1)[1].strip().rstrip('?').rstrip('.')
+                        
+                        # Determine which weather function to use
+                        if 'sunrise' in request_lower or 'sunset' in request_lower:
+                            from src.tools.weather_tools import get_sunrise_sunset
+                            result = get_sunrise_sunset(location=location)
+                        elif 'forecast' in request_lower:
+                            from src.tools.weather_tools import get_weather_forecast
+                            result = get_weather_forecast(location=location)
+                        else:
+                            from src.tools.weather_tools import get_current_weather
+                            result = get_current_weather(location=location)
+                        
+                        # Send results
+                        dm_message = f"{result}\n\n— {self.name}"
+                        self.client.chat_postMessage(channel=original_user, text=dm_message)
+                        self.client.chat_postMessage(
+                            channel=self.coordination_channel,
+                            text=f"✅ {self.name} completed – weather info sent to <@{original_user}>",
+                            thread_ts=thread_ts
+                        )
+                        return
+                    except Exception as e:
+                        self.logger.error(f"[{self.name}] Weather request failed: {e}")
+                        # Fall through to AI agent
+                
+                # Special handling for research queries (but not if it's a Socratic request)
+                elif (not is_socratic_request and 
+                      any(word in request_lower for word in ['research', 'search', 'find', 'investigate', 'deep dive', 'deep research', 'how starfish', 'starfish'])
+                      and self.name == "Grok"):
+                    # Extract the research topic from the request
+                    topic = request_text
+                    for prefix in ['do deep research query on', 'do deep research qeury on', 'can you do a deep research task on', 'research on', 'search for', 'find information about', 'tell me about']:
+                        if prefix in request_lower:
+                            topic = request_text.lower().split(prefix)[-1].strip()
+                            break
+                    topic = topic.replace('how ', '').replace('?', '').strip()
+                    
+                    # Directly execute the deep research tool instead of going through the AI agent
+                    self.logger.info(f"[{self.name}] 🔍 Directly executing deep research on topic: '{topic}'")
+                    try:
+                        from src.tools.agent_tools import deep_research_tool
+                        research_result = deep_research_tool(topic, 3)
+                        
+                        # Send results to user
+                        dm_message = f"Here's my research on '{topic}':\n\n{research_result}\n\n— {self.name}"
+                        dm_result = self.client.chat_postMessage(
+                            channel=original_user,
+                            text=dm_message
+                        )
+                        self.logger.info(f"[{self.name}] ✅ Research results sent via DM: {dm_result['ok']}")
+                        
+                        # Report completion
+                        self.client.chat_postMessage(
+                            channel=self.coordination_channel,
+                            text=f"✅ {self.name} completed – deep research results sent to <@{original_user}>",
+                            thread_ts=thread_ts
+                        )
+                        return
+                    except Exception as e:
+                        self.logger.error(f"[{self.name}] ❌ Deep research execution failed: {e}", exc_info=True)
+                        # Fall through to normal processing
+                        
+                    thinking_prompt = (
+                        f"You are {self.name}, an expert research specialist.\n\n"
+                        f"The user wants research on: {topic}\n\n"
+                        "You must call the deep_research_tool to gather comprehensive information.\n"
+                        f"Execute this exact command:\n"
+                        f"deep_research_tool('{topic}', 3)\n\n"
+                        "That's it. Just output that single line, nothing else."
+                    )
+                else:
+                    thinking_prompt = (
+                        f"You are {self.name}, a helpful AI assistant.\n\n"
+                        f"User's request: {request_text}\n\n"
+                        "Recent conversation context:\n"
+                        f"{context_str if context_str else '(No previous context)'}\n\n"
+                        "Available tools (call exactly as shown, no markdown, no quotes):\n"
+                        f"{tools_list}\n\n"
+                        "When you are ready to answer, choose ONE of these actions:\n"
+                        "1. If a direct message is appropriate → write a single line that is JUST the function call, e.g.\n"
+                        f"   slack_dm_tool('{original_user}', 'Hello! …')\n"
+                        "2. If replying in the thread is better → use slack_channel_tool with thread_ts.\n"
+                        "3. If the user asks for TTS or text-to-speech → use slack_tts_tool(user_id, text).\n"
+                        "4. If no tool is needed, output the plain answer text.\n\n"
+                        "Do NOT wrap calls in back-ticks or code blocks. Output nothing else after the call line."
+                    )
 
                 self.logger.debug(f"Prompt length: {len(thinking_prompt)} chars")
-                self.logger.info("Calling AI agent...")
+                
+                # Determine if we really need DSPy for this task
+                needs_complex_reasoning = (
+                    is_socratic_request or
+                    'analyze' in request_lower or
+                    'explain' in request_lower or
+                    'compare' in request_lower or
+                    'evaluate' in request_lower or
+                    len(request_text) > 100  # Long, complex requests
+                )
+                
+                # Only use DSPy if it's available AND we need complex reasoning
+                use_dspy_for_this_request = self.dspy_available and needs_complex_reasoning
+                
+                self.logger.info(f"Calling AI agent... (DSPy: {use_dspy_for_this_request})")
 
                 try:
-                    result = self.ai_agent.run(thinking_prompt)
-                    self.logger.info(f"AI agent returned: {str(result)[:200]}...")
+                    if use_dspy_for_this_request:
+                        # DSPy execution - pass request directly with user_id and context
+                        if hasattr(self.ai_agent, 'forward'):
+                            # Check if the module accepts user_id and context
+                            import inspect
+                            sig = inspect.signature(self.ai_agent.forward)
+                            params = sig.parameters
+                            
+                            if 'user_id' in params and 'context' in params:
+                                result = self.ai_agent.forward(request_text, user_id=original_user, context=context)
+                            elif 'context' in params:
+                                result = self.ai_agent.forward(request_text, context=context)
+                            else:
+                                result = self.ai_agent.forward(request_text)
+                        else:
+                            result = self.ai_agent.run(thinking_prompt)
+                        self.logger.info(f"[{self.name}] 🧠 DSPy agent returned: {str(result)[:200]}...")
+                    else:
+                        # Existing execution with thinking_prompt
+                        result = self.ai_agent.run(thinking_prompt)
+                        self.logger.info(f"[{self.name}] 🤖 AI agent returned: {str(result)[:200]}...")
+                    
+                    # Special handling for Grok research results
+                            # The result should be the output of deep_research_tool
+                        # Send it directly to the user
+                        if isinstance(result, str) and "Deep Research Report" in result:
+                            # Format the message nicely
+                            dm_message = f"Here's my research on '{topic}':\n\n{result}\n\n— {self.name}"
+                            dm_result = self.client.chat_postMessage(
+                                channel=original_user,
+                                text=dm_message
+                            )
+                            self.logger.info(f"Research results sent via DM: {dm_result['ok']}")
+                            
+                            # Report completion
+                            self.client.chat_postMessage(
+                                channel=self.coordination_channel,
+                                text=f"✅ {self.name} completed – research results sent to <@{original_user}>",
+                                thread_ts=thread_ts
+                            )
+                            return
+                    
+                    # If the result contains an error, handle it gracefully
+                    if isinstance(result, str) and "ModelError:" in result:
+                        # Extract the actual error message
+                        error_msg = result.split("ModelError:", 1)[1].strip()
+                        self.logger.error(f"Model error occurred: {error_msg}")
+                        
+                        # Try to provide a helpful response
+                        if "string indices must be integers" in error_msg:
+                            result = "I encountered an issue processing the research results. Let me try a simpler approach."
+                            # Fallback to web search
+                            from src.tools.agent_tools import web_search_tool
+                            search_result = web_search_tool(request_text)
+                            result = f"Here's what I found:\n\n{search_result}"
+                        else:
+                            result = f"I encountered an error: {error_msg}. Please try rephrasing your request."
+                            
                 except Exception as ai_error:
                     self.logger.error(f"AI agent error: {ai_error}", exc_info=True)
                     result = f"I encountered an error while processing your request: {str(ai_error)}"

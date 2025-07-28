@@ -24,3 +24,10 @@ features:
     default_voice: "en-US-AriaNeural"
     default_rate: "+0%"
     max_text_length: 5000
+  
+  search:
+    # BeautifulSoup-based search system - no rate limiting needed
+    enabled: true
+    engines: ["google", "bing", "wikipedia", "duckduckgo"]
+    timeout: 15  # seconds for each search request
+    max_results_per_engine: 5

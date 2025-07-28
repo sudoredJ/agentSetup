@@ -1,6 +1,6 @@
 # Project Architecture & Code Audit
 
-*Last updated: {{DATE}}*
+*Last updated: 2025-07-27*
 
 ---
 
@@ -154,6 +154,37 @@ slack-smolagents-bot/
 | torch / numpy / sklearn | Only RL prototype | Remove when prototype removed |
 | edge-tts | `slack_tools.slack_tts_tool` | Optional — mark as extra |
 | rich / yaspin / alive-progress | CLI UX | Keep |
+
+---
+
+## 9. Recent Fixes and Enhancements (2025-07-27)
+
+### Deep Research Functionality
+- **Fixed**: Deep research tool now properly handles DuckDuckGo rate limits
+- **Added**: Automatic delays between searches to prevent rate limiting
+- **Enhanced**: Direct execution of deep_research_tool in Grok agent for research queries
+- **Improved**: Topic extraction from various query formats ("research on", "deep dive", etc.)
+
+### Rate Limit Handling
+- **Implemented**: Graceful handling of DuckDuckGo rate limits with user-friendly error messages
+- **Added**: Time delays in web_search_tool and deep_research_tool to avoid rate limits
+- **Enhanced**: Partial results returned when rate limits are hit mid-research
+
+### Direct Execution Approach
+- **Optimization**: Grok agent now directly executes deep_research_tool for research queries
+- **Benefit**: Bypasses LLM interpretation issues for more reliable results
+- **Fallback**: Automatic fallback to web_search_tool on deep research failures
+
+### FriendlyCodeAgent Enhancements
+- **Added**: Proper fallback mechanism when smolagents is unavailable
+- **Implemented**: Manual tool call extraction from model responses
+- **Support**: Multiple tool invocation formats (bare calls, backticks, code blocks)
+- **Enhanced**: Flexible argument parsing for both positional and keyword arguments
+
+### Error Handling Improvements
+- **Fixed**: Model errors now caught and handled gracefully
+- **Added**: Fallback responses to ensure users always receive feedback
+- **Enhanced**: Better error messages for string parsing issues in tool execution
 
 ---
 

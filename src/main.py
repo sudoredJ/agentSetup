@@ -1,11 +1,11 @@
 import os
 import sys
-import yaml
 import logging
 import threading
 import time
 import re
 import atexit
+import yaml
 from typing import Dict, Any
 from dotenv import load_dotenv
 from rich.panel import Panel
@@ -126,111 +126,8 @@ def main():
     coordination_channel = config['channels']['coordination']
 
     # ------------------------------------------------ Assignment logic
-    def check_and_assign(client, thread_ts: str, request_data: dict | None = None):
-        """Poll the thread for evaluation messages and assign the best specialist."""
-        timeout = 8          # seconds total wait (increased)
-        check_interval = 0.5 # seconds between polls (decreased)
-        start_time = time.time()
-
-        logging.info(f"Checking thread {thread_ts} for evaluations... (timeout {timeout}s)")
-        logging.info(f"Expected specialists: {list(specialists.keys())}")
-
-        evaluations: Dict[str, int] = {}
-
-        try:
-            with yaspin(text="Waiting for evaluations", color="cyan") as spin:
-                while time.time() - start_time < timeout:
-                    try:
-                        # Fresh API call every loop so we don't miss late messages
-                        thread = client.conversations_replies(channel=coordination_channel, ts=thread_ts)
-                    except SlackApiError as api_err:
-                        # Handle rate limiting gracefully
-                        if api_err.response.get("error") == "ratelimited":
-                            retry_after = int(api_err.response.headers.get("Retry-After", 2))
-                            logging.warning(f"Rate limited when fetching thread {thread_ts}. Retrying after {retry_after}s…")
-                            time.sleep(retry_after)
-                            continue  # retry loop without counting towards timeout
-                        else:
-                            raise
-
-                    for msg in thread.get("messages", []):
-                        text = msg.get("text", "")
-
-                        # Pattern: agent evaluation report (with or without emoji)
-                        # Try both patterns to be flexible
-                        match = re.search(r'(?:🧠\s*)?(\w+)\s+reporting:\s+Confidence\s+(\d+)%', text)
-
-                        if match:
-                            agent_name = match.group(1)
-                            confidence = int(match.group(2))
-                            if agent_name not in evaluations:
-                                evaluations[agent_name] = confidence
-                                logging.info(f"  Found evaluation: {agent_name} = {confidence}%")
-                                spin.text = f"Collected {len(evaluations)}/{len(specialists)} evaluations"
-
-                    if len(evaluations) >= len(specialists):
-                        logging.info("All specialists have responded!")
-                        break
-
-                    time.sleep(check_interval)
-
-                # end while loop
-                spin.ok("✔")
-
-            logging.info(f"Total evaluations received: {len(evaluations)} out of {len(specialists)} specialists")
-            missing_specialists = set(specialists.keys()) - set(evaluations.keys())
-            if missing_specialists:
-                logging.warning(f"Missing responses from: {missing_specialists}")
-            
-            if evaluations:
-                logging.info(f"Evaluations: {evaluations}")
-            else:
-                logging.info("No evaluations found. Dumping raw thread messages for debugging…")
-                thread = client.conversations_replies(channel=coordination_channel, ts=thread_ts)
-                for i, msg in enumerate(thread.get("messages", [])):
-                    logging.info(f"Message {i}: {msg.get('text', '')[:120]}")
-
-            # Assign best specialist
-            if evaluations:
-                agent_name, confidence = max(evaluations.items(), key=lambda x: x[1])
-                if confidence > 0 and agent_name in specialists:
-                    specialist = specialists[agent_name]
-                    logging.info(f"Assigning to {agent_name} (confidence: {confidence}%)")
-                    try:
-                        client.chat_postMessage(
-                            channel=coordination_channel, 
-                            thread_ts=thread_ts,
-                            text=f"ASSIGNED: <@{specialist.bot_user_id}> - Please handle this request."
-                        )
-                    except Exception as e:
-                        logging.error(f"Failed to post assignment: {e}")
-                else:
-                    client.chat_postMessage(
-                        channel=coordination_channel, 
-                        thread_ts=thread_ts,
-                        text="No specialist confident enough to handle this request."
-                    )
-            else:
-                logging.warning(f"No evaluations received in time!")
-                try:
-                    client.chat_postMessage(
-                        channel=coordination_channel, 
-                        thread_ts=thread_ts,
-                        text="No specialists responded to evaluation request."
-                    )
-                except Exception as e:
-                    logging.error(f"Failed to post no-response message: {e}")
-
-        except Exception as e:
-            logging.error(f"Assignment error: {e}", exc_info=True)
-            try:
-                client.chat_postMessage(
-                    channel=coordination_channel, 
-                    thread_ts=thread_ts,
-                    text=f"Error during assignment: {str(e)}"
-                )
-            except Exception:
-                pass
+    # Note: Assignment logic has been moved to src/orchestrator/assignment.py
+    # The external version (ext_check_and_assign) is used with proper rate limit handling
 
     # ------------------------------------------------ Orchestrator handlers
     @orchestrator.app.event("app_mention")
@@ -274,7 +171,7 @@ def main():
             channel=coordination_channel,
             text=(
                 f"Request from <@{user_id}> | Task: \"{escaped_text}\"\n\n"
-                f"{specialist_mentions} please evaluate."
+                f"{specialist_mentions} please evaluate your confidence for this specific task."
             )
         )
 
@@ -472,7 +369,7 @@ def main():
         try:
             res = spec.client.chat_postMessage(
                 channel=coordination_channel, 
-                text=f"🤖 {name} online and ready!"
+                text="✅"
             )
             if res.get('ok'):
                 logging.info(f"✓ {name} connected to coordination channel")
