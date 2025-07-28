@@ -13,7 +13,10 @@
       "Bash(uv venv:*)",
       "Bash(source:*)",
       "Bash(uv sync:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(move srctoolsbeautiful_search.py srctoolssearch)",
+      "Bash(git checkout:*)",
+      "WebFetch(domain:dspy.ai)"
     ],
     "deny": []
   }

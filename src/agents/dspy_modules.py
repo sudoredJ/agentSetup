@@ -4,19 +4,23 @@ import dspy
 import logging
 import os
 import sys
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 # Global flag to track if DSPy has been configured
 _dspy_configured = False
 
-def ensure_dspy_configured():
+def ensure_dspy_configured(force_reset=False):
     """Ensure DSPy is configured with an LM before creating any modules."""
     global _dspy_configured
     
-    if _dspy_configured:
+    logger = logging.getLogger("dspy_modules")
+    
+    # Always check if LM is actually configured, not just our flag
+    if not force_reset and _dspy_configured and hasattr(dspy.settings, 'lm') and dspy.settings.lm:
+        logger.debug("DSPy already configured with LM")
         return
     
-    logger = logging.getLogger("dspy_modules")
+    logger.info("Configuring DSPy...")
     
     try:
         # Check if LM is already configured
@@ -25,45 +29,55 @@ def ensure_dspy_configured():
             _dspy_configured = True
             return
         
-        # If not configured, try to configure with Claude
+        # If not configured, try to configure with Claude via LiteLLM
         logger.warning("DSPy LM not configured, attempting to configure...")
         
-        # Create LiteLLM wrapper for DSPy
-        class DSPyLiteLLMWrapper:
-            def __init__(self, model_id, api_base=None, api_key=None):
-                from litellm import completion
-                self.model_id = model_id
-                self.api_base = api_base
-                self.api_key = api_key
-                self.completion = completion
-            
-            def __call__(self, prompt, **kwargs):
-                messages = [{"role": "user", "content": prompt}]
-                response = self.completion(
-                    model=self.model_id,
-                    messages=messages,
-                    api_base=self.api_base,
-                    api_key=self.api_key,
-                    **kwargs
-                )
-                return response.choices[0].message.content
-            
-            def __repr__(self):
-                return f"DSPyLiteLLMWrapper(model={self.model_id})"
-        
-        # Configure with Claude
+        # Get API key
         api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if api_key:
-            lm = DSPyLiteLLMWrapper(
-                model_id="claude-3-haiku-20240307",
-                api_base="https://api.anthropic.com/v1",
+        if not api_key:
+            raise ValueError("No ANTHROPIC_API_KEY found for DSPy configuration")
+        
+        # Configure LiteLLM to use Claude
+        os.environ["ANTHROPIC_API_KEY"] = api_key  # Ensure it's set for LiteLLM
+        
+        # Use dspy.LM with LiteLLM backend
+        # DSPy 2.5+ uses dspy.LM class
+        try:
+            # Try the newer DSPy API first
+            # For Claude via litellm, use the anthropic/ prefix
+            lm = dspy.LM(
+                model="anthropic/claude-3-haiku-20240307",
                 api_key=api_key
             )
-            dspy.settings.configure(lm=lm)  # Use correct API as per DSPy docs
-            logger.info("Configured DSPy with Claude LM")
+            dspy.settings.configure(lm=lm)
+            logger.info("Configured DSPy with Claude LM using dspy.LM")
             _dspy_configured = True
-        else:
-            raise ValueError("No ANTHROPIC_API_KEY found for DSPy configuration")
+        except Exception as e1:
+            logger.warning(f"Failed with dspy.LM: {e1}, trying legacy approach")
+            
+            # Fallback to older approach
+            try:
+                # Create a simple callable that works with DSPy
+                class SimpleLM:
+                    def __init__(self):
+                        import litellm
+                        self.litellm = litellm
+                    
+                    def __call__(self, prompt, **kwargs):
+                        response = self.litellm.completion(
+                            model="anthropic/claude-3-haiku-20240307",
+                            messages=[{"role": "user", "content": prompt}],
+                            api_key=api_key
+                        )
+                        return [response.choices[0].message.content]
+                
+                lm = SimpleLM()
+                dspy.settings.configure(lm=lm)
+                logger.info("Configured DSPy with Claude LM using SimpleLM wrapper")
+                _dspy_configured = True
+            except Exception as e2:
+                logger.error(f"Both DSPy configuration attempts failed: {e1}, {e2}")
+                raise RuntimeError(f"Failed to configure DSPy: {e2}")
             
     except Exception as e:
         logger.error(f"Failed to configure DSPy: {e}")
@@ -77,49 +91,13 @@ class ResearchModule(dspy.Module):
         ensure_dspy_configured()  # Ensure DSPy is configured before creating modules
         self.logger = logging.getLogger(self.__class__.__name__)
         
-        # Initialize LM for DSPy
+        # Create DSPy modules
         try:
-            import litellm
-            from litellm import completion
-            
-            # Create a DSPy-compatible LM wrapper
-            class DSPyLiteLLMWrapper:
-                def __init__(self):
-                    self.logger = logging.getLogger(self.__class__.__name__)
-                
-                def __call__(self, prompt, **kwargs):
-                    try:
-                        # Use Claude for research tasks
-                        response = completion(
-                            model="claude-3-haiku-20240307",
-                            messages=[{"role": "user", "content": prompt}],
-                            api_base="https://api.anthropic.com/v1",
-                            api_key=os.environ.get("ANTHROPIC_API_KEY")
-                        )
-                        return response.choices[0].message.content
-                    except Exception as e:
-                        self.logger.error(f"LM call failed: {e}")
-                        return f"Error: {str(e)}"
-                
-                # DSPy compatibility methods
-                def basic_request(self, prompt, **kwargs):
-                    return self.__call__(prompt, **kwargs)
-                
-                def __repr__(self):
-                    return "DSPyLiteLLMWrapper(model=claude-3-haiku-20240307)"
-            
-            # Configure DSPy with LM
-            lm = DSPyLiteLLMWrapper()
-            dspy.settings.configure(lm=lm)  # Use correct API as per DSPy docs
-            
-            # Create DSPy modules
             self.generate_queries = dspy.ChainOfThought("topic -> query1, query2, query3")
             self.synthesize = dspy.ChainOfThought("results -> summary")
-            
-            self.logger.info("Research module DSPy LM initialized successfully")
-            
+            self.logger.info("Research module initialized successfully with DSPy chains")
         except Exception as e:
-            self.logger.error(f"Failed to initialize Research module LM: {e}")
+            self.logger.error(f"Failed to initialize Research module: {e}")
             # Create mock DSPy modules for testing
             self.generate_queries = self._create_mock_chain("topic -> query1, query2, query3")
             self.synthesize = self._create_mock_chain("results -> summary")
@@ -159,7 +137,7 @@ class ResearchModule(dspy.Module):
             tools_path = os.path.join(os.path.dirname(__file__), '..', 'tools')
             if tools_path not in sys.path:
                 sys.path.insert(0, tools_path)
-            from beautiful_search import beautiful_search
+            from search.beautiful_search import beautiful_search
             self.beautiful_search = beautiful_search
             self.logger.info("Research module initialized with BeautifulSoup search")
         except ImportError as e:
@@ -172,6 +150,11 @@ class ResearchModule(dspy.Module):
             return "ERROR: BeautifulSoup search system not available"
         
         try:
+            # Double-check LM is still configured
+            if not hasattr(dspy.settings, 'lm') or not dspy.settings.lm:
+                self.logger.error("DSPy LM lost during ResearchModule.forward() call")
+                ensure_dspy_configured()  # Try to reconfigure
+            
             # Generate multiple search queries
             queries = self.generate_queries(topic=topic)
             
@@ -289,7 +272,7 @@ class AnalysisModule(dspy.Module):
             tools_path = os.path.join(os.path.dirname(__file__), '..', 'tools')
             if tools_path not in sys.path:
                 sys.path.insert(0, tools_path)
-            from beautiful_search import beautiful_search
+            from search.beautiful_search import beautiful_search
             self.beautiful_search = beautiful_search
             self.logger.info("Analysis module initialized with BeautifulSoup search")
         except ImportError as e:
@@ -355,84 +338,17 @@ class GrokDSPyAgent(dspy.Module):
         self.system_prompt = system_prompt  # Store the system prompt
         self.logger = logging.getLogger(self.__class__.__name__)
         
-        # Initialize DSPy with the model
-        try:
-            import litellm
-            from litellm import completion
-            
-            # Create a DSPy-compatible LM wrapper
-            class DSPyLiteLLMWrapper:
-                def __init__(self, model_id, api_base=None, api_key=None):
-                    self.model_id = model_id
-                    self.api_base = api_base
-                    self.api_key = api_key
-                    self.logger = logging.getLogger(self.__class__.__name__)
-                
-                def __call__(self, prompt, **kwargs):
-                    try:
-                        response = completion(
-                            model=self.model_id,
-                            messages=[{"role": "user", "content": prompt}],
-                            api_base=self.api_base,
-                            api_key=self.api_key,
-                            **kwargs
-                        )
-                        return response.choices[0].message.content
-                    except Exception as e:
-                        self.logger.error(f"LM call failed: {e}")
-                        return f"Error: {str(e)}"
-                
-                # DSPy compatibility methods
-                def basic_request(self, prompt, **kwargs):
-                    return self.__call__(prompt, **kwargs)
-                
-                def __repr__(self):
-                    return f"DSPyLiteLLMWrapper(model={self.model_id})"
-            
-            # Create the LM wrapper
-            if "claude" in model_id:
-                self.lm = DSPyLiteLLMWrapper(
-                    model_id=model_id,
-                    api_base="https://api.anthropic.com/v1",
-                    api_key=os.environ.get("ANTHROPIC_API_KEY")
-                )
-            else:
-                self.lm = DSPyLiteLLMWrapper(
-                    model_id=model_id,
-                    api_key=os.environ.get("OPENAI_API_KEY")
-                )
-            
-            # Configure DSPy to use our LM
-            dspy.settings.configure(lm=self.lm)  # Use correct API as per DSPy docs
-            self.logger.info(f"Grok DSPy LM initialized with model: {model_id}")
-            
-        except Exception as e:
-            self.logger.error(f"Failed to initialize LM: {e}")
-            # Create a mock LM for testing
-            self.lm = self._create_mock_lm()
-            self.logger.warning("Using mock LM for testing - DSPy features will be limited")
+        # Ensure DSPy is configured
+        ensure_dspy_configured()
+        
+        # Store the model information
+        self.model_id = model_id
         
         # Initialize components
         self._init_modules()
         self._init_tool_selector()
         self._init_system_prompt()
     
-    def _create_mock_lm(self):
-        """Create a mock LM for testing when real LM is not available."""
-        class MockLM:
-            def __init__(self):
-                self.logger = logging.getLogger(self.__class__.__name__)
-            
-            def __call__(self, prompt, **kwargs):
-                # Simple mock response for testing
-                if "research" in prompt.lower():
-                    return "Mock research response: Here's some research about the topic."
-                elif "tool" in prompt.lower():
-                    return "tool_name: web_search_tool, tool_args: query=test"
-                else:
-                    return "Mock response: This is a test response from the mock LM."
-        
-        return MockLM()
     
     def _create_mock_research_module(self):
         """Create a mock research module for testing."""
@@ -467,10 +383,12 @@ class GrokDSPyAgent(dspy.Module):
     def _init_tool_selector(self):
         """Initialize tool selector."""
         try:
-            self.tool_selector = dspy.ChainOfThought("request, context -> tool_name, tool_args")
+            # DSPy signature should be a simple one-line format
+            self.tool_selector = dspy.ChainOfThought("request, available_tools, context -> tool_name, tool_args")
+            self.logger.info("Tool selector initialized with DSPy ChainOfThought")
         except Exception as e:
             self.logger.error(f"Failed to create tool selector: {e}")
-            # Create a mock tool selector
+            # Create a fallback tool selector
             self.tool_selector = self._create_mock_tool_selector()
     
     def _create_mock_tool_selector(self):
@@ -479,11 +397,31 @@ class GrokDSPyAgent(dspy.Module):
             def __init__(self):
                 self.logger = logging.getLogger(self.__class__.__name__)
             
-            def __call__(self, request, context):
-                # Return mock structured output
-                return type('MockDecision', (), {
-                    'tool_name': 'web_search_tool',
-                    'tool_args': 'query=test'
+            def __call__(self, request, available_tools=None, context=None):
+                # This is a fallback when DSPy fails - use simple logic
+                request_lower = request.lower()
+                
+                # Simple keyword-based tool selection
+                if any(word in request_lower for word in ['weather', 'temperature', 'forecast', 'rain', 'snow', 'sunny', 'cloudy']):
+                    return type('MockDecision', (), {
+                        'tool_name': 'get_current_weather',
+                        'tool_args': 'location=None'
+                    })()
+                elif any(word in request_lower for word in ['sunrise', 'sunset', 'dawn', 'dusk']):
+                    return type('MockDecision', (), {
+                        'tool_name': 'get_sunrise_sunset',
+                        'tool_args': 'location=None'
+                    })()
+                elif 'arxiv' in request_lower or 'paper' in request_lower:
+                    return type('MockDecision', (), {
+                        'tool_name': 'search_arxiv_papers',
+                        'tool_args': f'query={request}'
+                    })()
+                else:
+                    # Default to web search
+                    return type('MockDecision', (), {
+                        'tool_name': 'web_search_tool',
+                        'tool_args': f'query={request}'
                 })()
         
         return MockToolSelector()
@@ -494,37 +432,176 @@ class GrokDSPyAgent(dspy.Module):
         pass
         
     def forward(self, request: str, context: List[Dict] = None) -> str:
-        """Enhanced execution with research and Socratic capabilities."""
+        """Enhanced execution with keyword-based tool routing."""
         request_lower = request.lower()
         
-        # First check if this is a Socratic dialog request - PRIORITY
-        if any(phrase in request_lower for phrase in ['socratic', 'help me think', 'guide me through', 'explore with me', 'let\'s discuss']):
-            # Check if we have Socratic module
-            if hasattr(self, 'socratic_module') and self.socratic_module:
-                self.logger.info("Grok handling Socratic dialog request")
-                # Extract user_id from context if available
-                user_id = self._extract_user_id(context)
-                return self.socratic_module.forward(request, user_id=user_id, context=context)
-            else:
-                return "I'd love to engage in Socratic dialog, but I need the Socratic module to be properly initialized first."
-        
-        # Check if we're continuing a Socratic dialog
-        elif context and hasattr(self, 'socratic_module') and self.socratic_module and self.socratic_module._is_dialog_continuation(context):
-            self.logger.info("Grok continuing Socratic dialog")
-            user_id = self._extract_user_id(context)
-            return self.socratic_module.forward(request, user_id=user_id, context=context)
-        
-        # Then check if this is a research request
-        elif any(word in request_lower for word in ['research', 'investigate', 'deep dive', 'search', 'find']):
-            # Extract topic
-            topic = self._extract_topic(request)
+        # Direct keyword-based tool routing
+        try:
+            # Weather-related queries
+            if any(word in request_lower for word in ['weather', 'temperature', 'forecast', 'rain', 'snow', 'sunny', 'cloudy', 'humid', 'wind']):
+                if 'forecast' in request_lower or 'next' in request_lower or 'tomorrow' in request_lower or 'week' in request_lower:
+                    tool = self._get_tool_by_name('get_weather_forecast')
+                else:
+                    tool = self._get_tool_by_name('get_current_weather')
+                
+                if tool:
+                    location = self._extract_location(request)
+                    result = tool(location=location)
+                    return str(result)
             
-            # Use DSPy research module with BeautifulSoup
-            result = self.research_module(topic=topic)
-            return result
-        else:
-            # Fall back to standard tool selection
+            # Sunrise/sunset queries
+            elif any(word in request_lower for word in ['sunrise', 'sunset', 'dawn', 'dusk', 'golden hour', 'sun rise', 'sun set']):
+                tool = self._get_tool_by_name('get_sunrise_sunset')
+                if tool:
+                    location = self._extract_location(request)
+                    result = tool(location=location)
+                    return str(result)
+            
+            # ArXiv/paper queries
+            elif 'arxiv' in request_lower or any(phrase in request_lower for phrase in ['academic paper', 'research paper', 'scientific paper', 'journal article']):
+                tool = self._get_tool_by_name('search_arxiv_papers')
+                if tool:
+                    # Extract search query
+                    query = request
+                    for prefix in ['search arxiv for', 'find arxiv paper on', 'arxiv paper on', 'find papers on']:
+                        if prefix in request_lower:
+                            query = request.split(prefix, 1)[1].strip()
+                            break
+                    result = tool(query=query)
+                    return str(result)
+            
+            # University queries
+            elif any(word in request_lower for word in ['university', 'universities', 'college', 'edu domain', '.edu']):
+                # Check if it's an email verification
+                if '@' in request and any(word in request_lower for word in ['verify', 'check', 'validate', 'email']):
+                    tool = self._get_tool_by_name('verify_university_email')
+                    if tool:
+                        # Extract email from request
+                        import re
+                        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+                        emails = re.findall(email_pattern, request)
+                        if emails:
+                            result = tool(email=emails[0])
+                            return str(result)
+                
+                # Check if listing by country
+                elif any(phrase in request_lower for phrase in ['universities in', 'colleges in', 'list universities']):
+                    tool = self._get_tool_by_name('list_universities_by_country')
+                    if tool:
+                        # Extract country
+                        country = None
+                        if ' in ' in request_lower:
+                            country = request.split(' in ', 1)[1].strip().rstrip('?.,!')
+                            # Capitalize country name properly
+                            country = ' '.join(word.capitalize() for word in country.split())
+                            # Handle common variations
+                            country_mapping = {
+                                'Czechia': 'Czech Republic',
+                                'Usa': 'United States',
+                                'Uk': 'United Kingdom',
+                                'Uae': 'United Arab Emirates'
+                            }
+                            country = country_mapping.get(country, country)
+                        if country:
+                            result = tool(country=country)
+                            return str(result)
+                
+                # General university search
+                else:
+                    tool = self._get_tool_by_name('search_university')
+                    if tool:
+                        # Extract search parameters
+                        kwargs = {}
+                        
+                        # Extract university name
+                        for prefix in ['search for', 'find', 'look up', 'search university']:
+                            if prefix in request_lower:
+                                name = request.split(prefix, 1)[1].strip().rstrip('?.,!')
+                                kwargs['name'] = name
+                                break
+                        
+                        # If no specific search, use the whole request
+                        if not kwargs:
+                            kwargs['name'] = request.replace('university', '').replace('universities', '').strip()
+                        
+                        result = tool(**kwargs)
+                        return str(result)
+            
+            # URL fetch requests
+            elif any(indicator in request_lower for indicator in ['http://', 'https://', '.com', '.org', '.net', 'fetch url', 'summarize url']):
+                tool = self._get_tool_by_name('fetch_and_summarize_tool')
+                if tool:
+                    # Extract URL from request
+                    import re
+                    url_pattern = r'https?://[^\s]+'
+                    urls = re.findall(url_pattern, request)
+                    if urls:
+                        result = tool(url=urls[0])
+                        return str(result)
+            
+            # Deep research requests (not weather/arxiv)
+            elif any(word in request_lower for word in ['research', 'investigate', 'deep dive']) and not any(word in request_lower for word in ['weather', 'arxiv', 'paper']):
+                tool = self._get_tool_by_name('deep_research_tool')
+                if tool:
+                    topic = self._extract_topic(request)
+                    result = tool(topic=topic, num_searches=3)
+                    return str(result)
+            
+            # General web search (including "what is" questions)
+            elif any(phrase in request_lower for phrase in ['what is', 'what are', 'who is', 'define', 'explain', 'search for', 'look up']):
+                tool = self._get_tool_by_name('web_search_tool')
+                if tool:
+                    # Clean up the query
+                    query = request
+                    for prefix in ['what is', 'what are', 'who is', 'define', 'explain', 'search for', 'look up']:
+                        if prefix in request_lower:
+                            query = request.lower().replace(prefix, '').strip()
+                            break
+                    result = tool(query=query)
+                    return str(result)
+            
+            # Socratic dialog requests
+            elif any(phrase in request_lower for phrase in ['socratic', 'help me think', 'guide me through', 'explore with me', 'let\'s discuss']):
+                if hasattr(self, 'socratic_module') and self.socratic_module:
+                    self.logger.info("Grok handling Socratic dialog request")
+                    user_id = self._extract_user_id(context)
+                    return self.socratic_module.forward(request, user_id=user_id, context=context)
+            
+            # If no keyword match, fall back to DSPy tool selection
+            else:
+                return self._execute_with_tools(request, context)
+                
+        except Exception as e:
+            self.logger.error(f"Error in keyword-based routing: {e}", exc_info=True)
+            # Fall back to DSPy tool selection
             return self._execute_with_tools(request, context)
+    
+    def _get_tool_by_name(self, tool_name: str):
+        """Get a tool by its name from the available tools."""
+        for tool in self.tools:
+            if hasattr(tool, 'name') and tool.name == tool_name:
+                return tool
+        self.logger.warning(f"Tool '{tool_name}' not found in available tools")
+        return None
+    
+    def _extract_location(self, request: str) -> Optional[str]:
+        """Extract location from request."""
+        request_lower = request.lower()
+        
+        # Common patterns for location extraction
+        patterns = [' in ', ' at ', ' for ', ' near ']
+        for pattern in patterns:
+            if pattern in request_lower:
+                parts = request_lower.split(pattern)
+                if len(parts) > 1:
+                    # Clean up the location
+                    location = parts[1].strip()
+                    # Remove trailing punctuation and common words
+                    location = location.rstrip('?.,!').strip()
+                    if location and location not in ['today', 'tomorrow', 'now', 'later']:
+                        return location
+        
+        return None  # Will use default location
     
     def _extract_topic(self, request: str) -> str:
         """Extract research topic from request."""
@@ -551,18 +628,75 @@ class GrokDSPyAgent(dspy.Module):
             context_str = self._format_context(context) if context else "No previous context"
             
             # Use DSPy to select tool
-            decision = self.tool_selector(request=request, context=context_str)
+            available_tools = list(tool_map.keys())
+            self.logger.info(f"Available tools for selection: {available_tools}")
+            
+            # Create a more explicit prompt for tool selection
+            tool_selection_context = f"""
+Available tools (ONLY select from this list):
+{chr(10).join(f"- {tool}: {self._extract_tool_signature(tool_map[tool])}" for tool in available_tools[:10])}
+
+Request: {request}
+Context: {context_str}
+
+IMPORTANT: You must select a tool name EXACTLY from the available tools list above.
+Do NOT invent tool names like 'Wikipedia' or 'Google' - use the actual tool names provided.
+"""
+            
+            # DSPy expects keyword arguments matching the signature
+            decision = self.tool_selector(
+                request=request, 
+                available_tools=tool_selection_context,
+                context=context_str
+            )
             
             self.logger.info(f"Grok DSPy selected tool: {decision.tool_name}")
             
+            # Map common hallucinated tools to real ones
+            tool_name_mapping = {
+                'wikipedia': 'web_search_tool',
+                'Wikipedia': 'web_search_tool',
+                'google': 'web_search_tool',
+                'Google': 'web_search_tool',
+                'search': 'web_search_tool',
+                'weather': 'get_current_weather',
+                'Weather': 'get_current_weather',
+            }
+            
+            actual_tool_name = decision.tool_name
+            if actual_tool_name not in tool_map and actual_tool_name in tool_name_mapping:
+                mapped_name = tool_name_mapping[actual_tool_name]
+                self.logger.warning(f"Mapping hallucinated tool '{actual_tool_name}' to '{mapped_name}'")
+                actual_tool_name = mapped_name
+            
             # Execute the selected tool
-            if decision.tool_name in tool_map:
-                tool = tool_map[decision.tool_name]
-                args = self._parse_tool_args(decision.tool_args)
+            if actual_tool_name in tool_map:
+                tool = tool_map[actual_tool_name]
+                args = self._parse_tool_args(decision.tool_args, actual_tool_name)
                 result = tool(**args) if isinstance(args, dict) else tool(*args)
                 return str(result)
             else:
-                return f"Tool '{decision.tool_name}' not found. Available: {list(tool_map.keys())}"
+                # DSPy selected an invalid tool - use fallback logic
+                self.logger.warning(f"DSPy selected invalid tool '{decision.tool_name}', using fallback")
+                
+                # For general "what is" questions, use web search
+                if request_lower.startswith(('what is', 'what are', 'define', 'explain')):
+                    if 'web_search_tool' in tool_map:
+                        query = request.replace('what is', '').replace('what are', '').strip()
+                        result = tool_map['web_search_tool'](query=query)
+                        return str(result)
+                
+                # For weather-related questions, use weather tools
+                elif any(word in request_lower for word in ['weather', 'temperature', 'forecast', 'rain', 'snow']):
+                    if 'get_current_weather' in tool_map:
+                        # Extract location if present
+                        location = None
+                        if ' in ' in request_lower:
+                            location = request.split(' in ', 1)[1].strip()
+                        result = tool_map['get_current_weather'](location=location)
+                        return str(result)
+                
+                return f"I couldn't find the right tool to answer your question. Let me try a web search instead.\n{tool_map.get('web_search_tool', lambda q: 'Web search not available')(query=request)}"
                 
         except Exception as e:
             self.logger.error(f"Grok DSPy execution error: {e}", exc_info=True)
@@ -589,30 +723,45 @@ class GrokDSPyAgent(dspy.Module):
         
         return "\n".join(formatted)
     
-    def _parse_tool_args(self, args_str: str) -> Dict[str, Any]:
+    def _parse_tool_args(self, args_str: str, tool_name: str = None) -> Dict[str, Any]:
         """Parse tool arguments from DSPy output."""
         args = {}
         if not args_str:
             return args
             
-        pairs = args_str.split(',')
-        for pair in pairs:
-            if '=' in pair:
-                key, value = pair.split('=', 1)
-                key = key.strip()
-                value = value.strip().strip('"\'')
-                
-                try:
-                    if value.lower() in ('true', 'false'):
-                        value = value.lower() == 'true'
-                    elif value.isdigit():
-                        value = int(value)
-                    elif '.' in value and value.replace('.', '').isdigit():
-                        value = float(value)
-                except:
-                    pass
-                
-                args[key] = value
+        # First check if it's key=value format
+        if '=' in args_str:
+            pairs = args_str.split(',')
+            for pair in pairs:
+                if '=' in pair:
+                    key, value = pair.split('=', 1)
+                    key = key.strip()
+                    value = value.strip().strip('"\'')
+                    
+                    try:
+                        if value.lower() in ('true', 'false'):
+                            value = value.lower() == 'true'
+                        elif value.isdigit():
+                            value = int(value)
+                        elif '.' in value and value.replace('.', '').isdigit():
+                            value = float(value)
+                    except:
+                        pass
+                    
+                    args[key] = value
+        else:
+            # If no key=value format, assume it's a single argument
+            # Determine the appropriate key based on the tool name
+            arg_value = args_str.strip().strip('"\'')
+            
+            # Choose the parameter name based on the tool
+            if tool_name and ('weather' in tool_name or 'sunrise' in tool_name or 'sunset' in tool_name):
+                args = {'location': arg_value}
+            elif tool_name and 'slack' in tool_name:
+                args = {'message': arg_value}
+            else:
+                # Default to 'query' for search tools
+                args = {'query': arg_value}
         
         return args
 
@@ -679,7 +828,7 @@ class SocraticModule(dspy.Module):
             tools_path = os.path.join(os.path.dirname(__file__), '..', 'tools')
             if tools_path not in sys.path:
                 sys.path.insert(0, tools_path)
-            from socratic_tools import question_generator_tool, dialog_tracker_tool, insight_extractor_tool
+            from dialog.socratic_tools import question_generator_tool, dialog_tracker_tool, insight_extractor_tool
             self.socratic_tools = {
                 'question_generator': question_generator_tool,
                 'dialog_tracker': dialog_tracker_tool,

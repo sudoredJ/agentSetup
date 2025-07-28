@@ -3,6 +3,7 @@
 import requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
+from smolagents import tool
 
 # Default location: Cambridge, MA
 DEFAULT_LATITUDE = 42.3736
@@ -32,6 +33,7 @@ def geocode_location(location: str) -> tuple[float, float, str]:
     raise ValueError(f"Could not find location: {location}")
 
 
+@tool
 def get_weather_forecast(
     location: Optional[str] = None,
     latitude: Optional[float] = None,
@@ -147,6 +149,7 @@ def get_weather_forecast(
         return f"Error getting weather forecast: {str(e)}"
 
 
+@tool
 def get_current_weather(
     location: Optional[str] = None,
     latitude: Optional[float] = None,
@@ -225,6 +228,7 @@ def get_current_weather(
         return f"Error getting current weather: {str(e)}"
 
 
+@tool
 def get_sunrise_sunset(
     location: Optional[str] = None,
     latitude: Optional[float] = None,

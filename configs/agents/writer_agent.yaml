@@ -23,19 +23,25 @@ system_prompt: |
   If user says "dm me": use slack_dm_tool(user_id, message)
   NEVER pass thread_ts to slack_dm_tool!
 tools:
-  - module: "src.tools.slack_tools"
+  - module: "src.tools.communication.slack_tools"
     functions:
       - "slack_dm_tool"
       - "slack_channel_tool"
       - "slack_post_tool"
       - "slack_tts_tool"
       - "lookup_user_tool"
-  - module: "src.tools.socratic_tools"
+  - module: "src.tools.dialog.socratic_tools"
     functions:
       - "question_generator_tool"
       - "dialog_tracker_tool"
       - "insight_extractor_tool"
-  - module: "src.tools.agent_tools"
+  - module: "src.tools.search.agent_tools"
     functions:
       - "compose_message_tool"
       - "proofread_tool"
+  - module: "src.tools.search.hackernews_tools"
+    functions:
+      - "get_top_hn_stories"
+      - "find_ai_law_stories"
+      - "check_hn_post_schedule"
+      - "record_hn_post"

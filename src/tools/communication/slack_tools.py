@@ -20,14 +20,54 @@ import logging
 import os
 import asyncio
 import uuid
-import edge_tts
 import requests
+import re
+
+# Lazy import for edge_tts to avoid ImportError when it's not installed
+edge_tts = None
+def _ensure_edge_tts():
+    global edge_tts
+    if edge_tts is None:
+        try:
+            import edge_tts as _edge_tts
+            edge_tts = _edge_tts
+        except ImportError:
+            raise ImportError(
+                "edge-tts is required for TTS functionality. "
+                "Install it with: pip install edge-tts"
+            )
 
 # Module-level storage for injected dependencies
 _client: WebClient | None = None
 _bot_name: str | None = None
 
 logger = logging.getLogger(__name__)
+
+
+def markdown_to_slack_mrkdwn(text: str) -> str:
+    """Convert standard markdown to Slack mrkdwn format.
+    
+    Args:
+        text: Text with standard markdown formatting
+        
+    Returns:
+        Text formatted for Slack mrkdwn
+    """
+    # Replace **bold** with *bold*
+    converted = text.replace('**', '*')
+    
+    # Replace __italic__ with _italic_
+    converted = converted.replace('__', '_')
+    
+    # Headers: Replace markdown headers with bold text
+    converted = re.sub(r'^#{1,6}\s+(.+)$', r'*\1*', converted, flags=re.MULTILINE)
+    converted = re.sub(r'\n#{1,6}\s+(.+)', r'\n*\1*', converted)
+    
+    # Lists are already compatible
+    # Code blocks with ``` are already compatible
+    # Links [text](url) are already compatible
+    
+    return converted
 
 
 @tool
@@ -43,9 +83,17 @@ def slack_dm_tool(user_id: str, message: str, thread_ts: str | None = None) -> s
         return "ERROR: Slack client not initialized"
 
     try:
-        formatted = f"Hello!\n\n{message}\n\n— {_bot_name or 'Assistant'}"
+        # Convert markdown to Slack mrkdwn format
+        formatted_message = markdown_to_slack_mrkdwn(message)
+        
+        formatted = f"Hello!\n\n{formatted_message}\n\n— {_bot_name or 'Assistant'}"
         logger.info(f"[slack_dm_tool] Sending DM to {user_id} | thread_ts={thread_ts} | len(message)={len(message)}")
-        _client.chat_postMessage(channel=user_id, text=formatted, thread_ts=thread_ts)
+        _client.chat_postMessage(
+            channel=user_id, 
+            text=formatted, 
+            thread_ts=thread_ts,
+            mrkdwn=True  # Explicitly enable mrkdwn
+        )
         logger.info("[slack_dm_tool] DM sent successfully")
         return f"DM sent successfully to user {user_id}"
     except Exception as e:
@@ -98,8 +146,11 @@ def slack_post_tool(channel_id: str, message: str, thread_ts: str | None = None)
         return "ERROR: Slack client not initialized"
 
     try:
+        # Convert markdown to Slack mrkdwn format
+        formatted_message = markdown_to_slack_mrkdwn(message)
+        
         logger.info(f"[slack_post_tool] Posting to {channel_id} | thread_ts={thread_ts} | len(message)={len(message)}")
-        _client.chat_postMessage(channel=channel_id, text=message, thread_ts=thread_ts)
+        _client.chat_postMessage(channel=channel_id, text=formatted_message, thread_ts=thread_ts, mrkdwn=True)
         logger.info("[slack_post_tool] Message posted successfully")
         return f"Message posted successfully to channel {channel_id}"
     except Exception as e:
@@ -120,7 +171,10 @@ def slack_channel_tool(channel_id: str, message: str, thread_ts: str | None = No
         return "Error: Slack client not initialized"
 
     try:
-        kwargs = {"channel": channel_id, "text": message}
+        # Convert markdown to Slack mrkdwn format
+        formatted_message = markdown_to_slack_mrkdwn(message)
+        
+        kwargs = {"channel": channel_id, "text": formatted_message, "mrkdwn": True}
         if thread_ts:
             kwargs["thread_ts"] = thread_ts
         logger.info(f"[slack_channel_tool] Posting to {channel_id} (thread_ts={thread_ts}) | len(message)={len(message)}")
@@ -146,6 +200,9 @@ def slack_tts_tool(channel_id: str, text: str, voice: str = "en-US-AriaNeural") 
         return "ERROR: Slack client not initialized"
 
     try:
+        # Ensure edge_tts is available
+        _ensure_edge_tts()
+        
         filename = f"tts_{uuid.uuid4().hex[:8]}.mp3"
 
         async def _generate():
@@ -196,13 +253,13 @@ def slack_tts_tool(channel_id: str, text: str, voice: str = "en-US-AriaNeural") 
         if link:
             preview = text[:100] + ("..." if len(text) > 100 else "")
             message = (
-                "🔊 **Text-to-Speech Audio Generated**\n\n"
+                "🔊 *Text-to-Speech Audio Generated*\n\n"
                 f"🔗 Download: {link}\n"
                 f"🎙️ Voice: `{voice}`\n"
                 f"📝 Text: _{preview}_\n\n"
                 "_Note: Link expires in 24 hours_"
             )
-            _client.chat_postMessage(channel=channel_id, text=message, unfurl_links=False)
+            _client.chat_postMessage(channel=channel_id, text=message, unfurl_links=False, mrkdwn=True)
             return f"TTS audio link sent to {channel_id}"
 
         return "Failed to upload audio to file sharing service"

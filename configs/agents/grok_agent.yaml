@@ -35,30 +35,35 @@ system_prompt: |
   If user says "dm me": use slack_dm_tool(user_id, message)
   NEVER pass thread_ts to slack_dm_tool!
 tools:
-  - module: "src.tools.agent_tools"
+  - module: "src.tools.search.agent_tools"
     functions: 
       - "analyze_request_tool"
       - "web_search_tool"
       - "deep_research_tool"
       - "fetch_and_summarize_tool"
-  - module: "src.tools.arxiv_tools"
+  - module: "src.tools.search.arxiv_tools"
     functions:
       - "search_arxiv_papers"
       - "get_arxiv_details"
       - "download_arxiv_paper"
       - "load_arxiv_to_context"
       - "get_arxiv_url"
-  - module: "src.tools.slack_tools"
+  - module: "src.tools.communication.slack_tools"
     functions:
       - "slack_dm_tool"
       - "slack_channel_tool"
       - "slack_post_tool"
       - "slack_tts_tool"
       - "lookup_user_tool"
-  - module: "src.tools.zoom_tools"
+  - module: "src.tools.external.zoom_tools"
     functions: ["create_zoom_meeting"]
-  - module: "src.tools.weather_tools"
+  - module: "src.tools.external.weather_tools"
     functions:
       - "get_weather_forecast"
       - "get_current_weather"
       - "get_sunrise_sunset"
+  - module: "src.tools.search.university_tools"
+    functions:
+      - "search_university"
+      - "verify_university_email"
+      - "list_universities_by_country"

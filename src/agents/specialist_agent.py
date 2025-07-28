@@ -19,6 +19,7 @@ class SpecialistAgent(BaseAgent):
         self.coordination_channel = coordination_channel
         self.thinking_step = 0
         self.pending_requests: Dict[str, Dict[str, Any]] = {}
+        self.ambient_task_started = False
 
         initialized_tools = self._initialize_tools()
 
@@ -92,6 +93,10 @@ class SpecialistAgent(BaseAgent):
                 max_steps=3
             )
             self.logger.info(f"[{self.name}] 🤖 Initialized with FriendlyCodeAgent")
+        
+        # Start ambient task for Writer agent
+        if self.name == "Writer" and not self.ambient_task_started:
+            self._start_ambient_hackernews_task()
 
     # ---------------------------------------------------------------------
     # Tool initialisation
@@ -120,7 +125,7 @@ class SpecialistAgent(BaseAgent):
                     self.logger.debug(f"Injected bot name '{self.bot_name}' into {module_path}")
 
                 # If this is the zoom_tools module, inject ZoomClient and slack client
-                if module_path == 'src.tools.zoom_tools':
+                if module_path == 'src.tools.external.zoom_tools':
                     if hasattr(module, '_zoom_client'):
                         module._zoom_client = getattr(self, '_zoom_stub', None) or ZoomClient()
                         self._zoom_stub = module._zoom_client  # cache so only one instance
@@ -268,6 +273,31 @@ class SpecialistAgent(BaseAgent):
         reasoning = f"{self.name} has {base_confidence}% confidence based on capabilities"
         return base_confidence, reasoning
 
+    def _send_slack_message(self, channel: str, text: str, thread_ts: str | None = None, mrkdwn: bool = True) -> dict:
+        """Send a Slack message with proper markdown conversion.
+        
+        Args:
+            channel: Channel or user ID to send to
+            text: Message text (may contain markdown)
+            thread_ts: Thread timestamp for replies
+            mrkdwn: Whether to enable Slack mrkdwn formatting
+            
+        Returns:
+            Slack API response
+        """
+        # Convert markdown to Slack mrkdwn if enabled
+        if mrkdwn:
+            from src.tools.communication.slack_tools import markdown_to_slack_mrkdwn
+            formatted_text = markdown_to_slack_mrkdwn(text)
+        else:
+            formatted_text = text
+            
+        kwargs = {"channel": channel, "text": formatted_text, "mrkdwn": mrkdwn}
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+            
+        return self.client.chat_postMessage(**kwargs)
+
     # ---------------------------------------------------------------------
     # Task processing
     # ---------------------------------------------------------------------
@@ -311,7 +341,7 @@ class SpecialistAgent(BaseAgent):
                     message = f"Same unit: {value}°{from_unit}"
 
                 # DM user
-                dm_result = self.client.chat_postMessage(
+                dm_result = self._send_slack_message(
                     channel=original_user,
                     text=f"Here is the conversion you requested:\n\n{message}\n\n— {self.name}"
                 )
@@ -331,7 +361,7 @@ class SpecialistAgent(BaseAgent):
                 match = re.search(r'dm me\s*["\']?(.*?)["\']?$', request_text, re.IGNORECASE)
                 message = match.group(1).strip() if match and match.group(1) else f"Hello from {self.name}!"
 
-                self.client.chat_postMessage(
+                self._send_slack_message(
                     channel=original_user,
                     text=f"👋 {message}\n\n— {self.name}"
                 )
@@ -346,7 +376,7 @@ class SpecialistAgent(BaseAgent):
             # ------------------------------------------------- Greeting
             elif request_lower in ["hello", "hi", "hey", "hello!", "hi!", "hey!"]:
                 self.logger.info("Handling greeting")
-                self.client.chat_postMessage(
+                self._send_slack_message(
                     channel=original_user,
                     text=f"👋 Hello! I'm {self.name}, your AI assistant. How can I help you today?\n\n— {self.name}"
                 )
@@ -369,7 +399,7 @@ class SpecialistAgent(BaseAgent):
 
                 try:
                     # Call slack_tts_tool directly
-                    from src.tools.slack_tools import slack_tts_tool  # local import
+                    from src.tools.communication.slack_tools import slack_tts_tool  # local import
                     result_msg = slack_tts_tool(original_user, tts_text)
                     self.client.chat_postMessage(
                         channel=self.coordination_channel,
@@ -432,6 +462,23 @@ class SpecialistAgent(BaseAgent):
                                    ('paper' in request_lower and any(word in request_lower for word in ['find', 'search', 'get', 'download', 'look'])) or
                                    any(word in request_lower for word in ['academic paper', 'research paper', 'publication', 'journal', 'preprint']))
                 
+                # Initialize default thinking_prompt to avoid UnboundLocalError
+                thinking_prompt = (
+                    f"You are {self.name}, a helpful AI assistant.\n\n"
+                    f"User's request: {request_text}\n\n"
+                    "Recent conversation context:\n"
+                    f"{context_str if context_str else '(No previous context)'}\n\n"
+                    "Available tools (call exactly as shown, no markdown, no quotes):\n"
+                    f"{tools_list}\n\n"
+                    "When you are ready to answer, choose ONE of these actions:\n"
+                    "1. If a direct message is appropriate → write a single line that is JUST the function call, e.g.\n"
+                    f"   slack_dm_tool('{original_user}', 'Hello! …')\n"
+                    "2. If replying in the thread is better → use slack_channel_tool with thread_ts.\n"
+                    "3. If the user asks for TTS or text-to-speech → use slack_tts_tool(user_id, text).\n"
+                    "4. If no tool is needed, output the plain answer text.\n\n"
+                    "Do NOT wrap calls in back-ticks or code blocks. Output nothing else after the call line."
+                )
+                
                 # Special handling for arXiv requests
                 if self.name == "Grok" and is_arxiv_request:
                     self.logger.info(f"[{self.name}] 📚 Detected arXiv request")
@@ -461,13 +508,13 @@ class SpecialistAgent(BaseAgent):
                     
                     # Execute arXiv search directly
                     try:
-                        from src.tools.arxiv_tools import search_arxiv_papers
+                        from src.tools.search.arxiv_tools import search_arxiv_papers
                         self.logger.info(f"[{self.name}] 🔍 Searching arXiv for: '{search_query}'")
                         search_results = search_arxiv_papers(query=search_query)
                         
                         # Send results to user
                         dm_message = f"Here are arXiv papers on '{search_query}':\n\n{search_results}\n\n— {self.name}"
-                        dm_result = self.client.chat_postMessage(
+                        dm_result = self._send_slack_message(
                             channel=original_user,
                             text=dm_message
                         )
@@ -484,7 +531,7 @@ class SpecialistAgent(BaseAgent):
                         self.logger.error(f"[{self.name}] ❌ arXiv search failed: {e}", exc_info=True)
                         # Send error message to user
                         error_msg = f"I encountered an error searching arXiv: {str(e)}\n\nPlease try rephrasing your request.\n\n— {self.name}"
-                        self.client.chat_postMessage(channel=original_user, text=error_msg)
+                        self._send_slack_message(channel=original_user, text=error_msg)
                         self.client.chat_postMessage(
                             channel=self.coordination_channel,
                             text=f"❌ {self.name} error: arXiv search failed - {str(e)}",
@@ -505,18 +552,18 @@ class SpecialistAgent(BaseAgent):
                         
                         # Determine which weather function to use
                         if 'sunrise' in request_lower or 'sunset' in request_lower:
-                            from src.tools.weather_tools import get_sunrise_sunset
+                            from src.tools.external.weather_tools import get_sunrise_sunset
                             result = get_sunrise_sunset(location=location)
                         elif 'forecast' in request_lower:
-                            from src.tools.weather_tools import get_weather_forecast
+                            from src.tools.external.weather_tools import get_weather_forecast
                             result = get_weather_forecast(location=location)
                         else:
-                            from src.tools.weather_tools import get_current_weather
+                            from src.tools.external.weather_tools import get_current_weather
                             result = get_current_weather(location=location)
                         
                         # Send results
                         dm_message = f"{result}\n\n— {self.name}"
-                        self.client.chat_postMessage(channel=original_user, text=dm_message)
+                        self._send_slack_message(channel=original_user, text=dm_message)
                         self.client.chat_postMessage(
                             channel=self.coordination_channel,
                             text=f"✅ {self.name} completed – weather info sent to <@{original_user}>",
@@ -542,12 +589,12 @@ class SpecialistAgent(BaseAgent):
                     # Directly execute the deep research tool instead of going through the AI agent
                     self.logger.info(f"[{self.name}] 🔍 Directly executing deep research on topic: '{topic}'")
                     try:
-                        from src.tools.agent_tools import deep_research_tool
+                        from src.tools.search.agent_tools import deep_research_tool
                         research_result = deep_research_tool(topic, 3)
                         
                         # Send results to user
                         dm_message = f"Here's my research on '{topic}':\n\n{research_result}\n\n— {self.name}"
-                        dm_result = self.client.chat_postMessage(
+                        dm_result = self._send_slack_message(
                             channel=original_user,
                             text=dm_message
                         )
@@ -564,6 +611,7 @@ class SpecialistAgent(BaseAgent):
                         self.logger.error(f"[{self.name}] ❌ Deep research execution failed: {e}", exc_info=True)
                         # Fall through to normal processing
                         
+                    # Override default prompt for research tasks
                     thinking_prompt = (
                         f"You are {self.name}, an expert research specialist.\n\n"
                         f"The user wants research on: {topic}\n\n"
@@ -571,22 +619,6 @@ class SpecialistAgent(BaseAgent):
                         f"Execute this exact command:\n"
                         f"deep_research_tool('{topic}', 3)\n\n"
                         "That's it. Just output that single line, nothing else."
-                    )
-                else:
-                    thinking_prompt = (
-                        f"You are {self.name}, a helpful AI assistant.\n\n"
-                        f"User's request: {request_text}\n\n"
-                        "Recent conversation context:\n"
-                        f"{context_str if context_str else '(No previous context)'}\n\n"
-                        "Available tools (call exactly as shown, no markdown, no quotes):\n"
-                        f"{tools_list}\n\n"
-                        "When you are ready to answer, choose ONE of these actions:\n"
-                        "1. If a direct message is appropriate → write a single line that is JUST the function call, e.g.\n"
-                        f"   slack_dm_tool('{original_user}', 'Hello! …')\n"
-                        "2. If replying in the thread is better → use slack_channel_tool with thread_ts.\n"
-                        "3. If the user asks for TTS or text-to-speech → use slack_tts_tool(user_id, text).\n"
-                        "4. If no tool is needed, output the plain answer text.\n\n"
-                        "Do NOT wrap calls in back-ticks or code blocks. Output nothing else after the call line."
                     )
 
                 self.logger.debug(f"Prompt length: {len(thinking_prompt)} chars")
@@ -635,7 +667,7 @@ class SpecialistAgent(BaseAgent):
                         if isinstance(result, str) and "Deep Research Report" in result:
                             # Format the message nicely
                             dm_message = f"Here's my research on '{topic}':\n\n{result}\n\n— {self.name}"
-                            dm_result = self.client.chat_postMessage(
+                            dm_result = self._send_slack_message(
                                 channel=original_user,
                                 text=dm_message
                             )
@@ -659,7 +691,7 @@ class SpecialistAgent(BaseAgent):
                         if "string indices must be integers" in error_msg:
                             result = "I encountered an issue processing the research results. Let me try a simpler approach."
                             # Fallback to web search
-                            from src.tools.agent_tools import web_search_tool
+                            from src.tools.search.agent_tools import web_search_tool
                             search_result = web_search_tool(request_text)
                             result = f"Here's what I found:\n\n{search_result}"
                         else:
@@ -678,7 +710,7 @@ class SpecialistAgent(BaseAgent):
                     if "the answer is" in clean_result.lower():
                         clean_result = clean_result.split("the answer is", 1)[1].strip()
 
-                    dm_result = self.client.chat_postMessage(
+                    dm_result = self._send_slack_message(
                         channel=original_user,
                         text=f"Regarding '{request_text}':\n\n{clean_result}\n\n— {self.name}"
                     )
@@ -701,3 +733,88 @@ class SpecialistAgent(BaseAgent):
                 )
             except:
                 pass
+    
+    # ---------------------------------------------------------------------
+    # Ambient tasks for Writer agent
+    # ---------------------------------------------------------------------
+    def _start_ambient_hackernews_task(self):
+        """Start the ambient HackerNews posting task for Writer agent."""
+        if self.ambient_task_started:
+            return
+        
+        self.ambient_task_started = True
+        self.logger.info(f"[{self.name}] Starting ambient HackerNews task")
+        
+        # Post immediately on launch
+        import threading
+        threading.Thread(target=self._post_hackernews_story, daemon=True).start()
+        
+        # Schedule regular checks every hour
+        self._schedule_hackernews_check()
+    
+    def _schedule_hackernews_check(self):
+        """Schedule the next HackerNews check."""
+        import threading
+        
+        def check_and_reschedule():
+            try:
+                # Check if it's time to post
+                for tool in self.ai_agent.tools:
+                    if hasattr(tool, 'name') and tool.name == 'check_hn_post_schedule':
+                        check_result = tool()
+                        self.logger.info(f"[{self.name}] HN schedule check: {check_result}")
+                        
+                        if "Time to post" in check_result or "Time to make the first post" in check_result:
+                            self._post_hackernews_story()
+                        break
+            except Exception as e:
+                self.logger.error(f"[{self.name}] Error checking HN schedule: {e}")
+            
+            # Schedule next check in 1 hour
+            timer = threading.Timer(3600.0, check_and_reschedule)  # 3600 seconds = 1 hour
+            timer.daemon = True
+            timer.start()
+        
+        # Start the first check in 1 hour
+        timer = threading.Timer(3600.0, check_and_reschedule)
+        timer.daemon = True
+        timer.start()
+    
+    def _post_hackernews_story(self):
+        """Post a HackerNews story about AI/law/human-AI interaction."""
+        try:
+            self.logger.info(f"[{self.name}] Attempting to post HackerNews story")
+            
+            # Find the most relevant AI/law story
+            story_result = None
+            for tool in self.ai_agent.tools:
+                if hasattr(tool, 'name') and tool.name == 'find_ai_law_stories':
+                    story_result = tool()
+                    break
+            
+            if not story_result or "No AI/law/human-AI stories found" in story_result:
+                self.logger.info(f"[{self.name}] No suitable HN story found to post")
+                return
+            
+            # Post to Slack coordination channel
+            try:
+                message = f"📰 *Daily AI/Law/Human-AI Story from HackerNews*\n\n{story_result}\n\n_Posted by {self.name} (Ambient Task)_"
+                
+                self._send_slack_message(
+                    channel=self.coordination_channel,
+                    text=message
+                )
+                
+                self.logger.info(f"[{self.name}] Successfully posted HN story to Slack")
+                
+                # Record the post
+                for tool in self.ai_agent.tools:
+                    if hasattr(tool, 'name') and tool.name == 'record_hn_post':
+                        tool()
+                        break
+                        
+            except Exception as e:
+                self.logger.error(f"[{self.name}] Error posting to Slack: {e}")
+                
+        except Exception as e:
+            self.logger.error(f"[{self.name}] Error in HN posting task: {e}", exc_info=True)
